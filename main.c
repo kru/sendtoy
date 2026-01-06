@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include "p2p_native.h"
 
 #include <stdio.h>
