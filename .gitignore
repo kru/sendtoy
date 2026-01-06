@@ -12,4 +12,6 @@
 *.bin
 *.ilk
 *.rdi
+*.pdb
+*.obj
 .vs
