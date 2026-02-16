@@ -69,6 +69,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
                 ctx->peers_known[i].port == advert->port) { 
                 
                 ctx->peers_known[i].last_seen_time = 1; 
+                memcpy(ctx->peers_known[i].public_key, advert->public_key, 32);
                 found = true;
                 printf("DEBUG: Updated peer %d\n", i);
                 break;
