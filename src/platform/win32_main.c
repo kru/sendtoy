@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include "../core/types.h"
 
@@ -194,6 +195,12 @@ int main(void) {
 
     // 2. Core Init
     state_init(&g_ctx);
+    
+    // TigerStyle: Init Random Identity (Temporary until Crypto)
+    srand((unsigned int)(time(NULL) ^ GetCurrentProcessId()));
+    for (int i = 0; i < 32; ++i) {
+        g_ctx.my_public_key[i] = (u8)rand();
+    }
     
     // Configuration Defaults
     g_ctx.config_listen_port = 44444;

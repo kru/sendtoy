@@ -201,6 +201,12 @@ int main(void) {
 
     state_init(&g_ctx);
     
+    // TigerStyle: Init Random Identity (Temporary until Crypto)
+    srand((unsigned int)(time(NULL) ^ getpid()));
+    for (int i = 0; i < 32; ++i) {
+        g_ctx.my_public_key[i] = (u8)rand();
+    }
+    
     // Configuration Defaults
     g_ctx.config_listen_port = 44444;
     g_ctx.config_target_port = 44444;

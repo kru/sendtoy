@@ -11,7 +11,7 @@ static void handle_tick(ctx_main_t* ctx) {
         
         // 1. Build Advert
         peer_advert_t advert = {0};
-        // memcpy(advert.public_key, ctx->my_public_key, 32); // TODO: Init keys
+        memcpy(advert.public_key, ctx->my_public_key, 32); 
         advert.ip_address = 0; // Filled by platform if 0
         advert.port = ctx->config_listen_port;
         
@@ -56,6 +56,12 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         }
         
         const peer_advert_t* advert = (const peer_advert_t*)body;
+
+        // TigerStyle: Ignore self
+        if (memcmp(advert->public_key, ctx->my_public_key, 32) == 0) {
+            // printf("DEBUG: Ignored own packet\n");
+            return;
+        }
         
         bool found = false;
         for (u32 i = 0; i < ctx->peers_count; ++i) {
