@@ -16,3 +16,6 @@
 *.obj
 *.idb
 .vs
+build/
+*.out
+.agent/
