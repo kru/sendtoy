@@ -112,6 +112,11 @@ typedef struct TIGER_ALIGN(64) ctx_main {
     u8  my_public_key[32];
     u8  my_private_key[32];
     
+    // Configuration
+    u16 config_listen_port;
+    u16 config_target_port;
+    u32 _padding_config;
+    
     // Discovery
     peer_entry_t    peers_known[PEERS_MAX];
     u32             peers_count;
