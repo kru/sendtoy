@@ -219,6 +219,13 @@ int main(void) {
 
     printf("[TigerStyle] Listening on port %d...\n", g_ctx.config_listen_port);
 
+    // Command Line Args: Target IP
+    const char* target_ip = "255.255.255.255";
+    if (__argc > 1) {
+        target_ip = __argv[1];
+        printf("[TigerStyle] Targeting Peer IP: %s\n", target_ip);
+    }
+
     // 4. Main Loop
     u64 last_tick = platform_get_time_ms();
 
@@ -234,8 +241,8 @@ int main(void) {
             
             // TigerStyle Output: Flush Outbox
             if (g_ctx.outbox_len > 0) {
-                 printf("DEBUG: UDP Broadcast %d bytes\n", g_ctx.outbox_len);
-                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, "255.255.255.255", g_ctx.config_target_port);
+                 printf("DEBUG: Sending %d bytes to %s\n", g_ctx.outbox_len, target_ip);
+                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, target_ip, g_ctx.config_target_port);
                  g_ctx.outbox_len = 0;
             }
         }

@@ -191,8 +191,14 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[1500];
 
-int main(void) {
+int main(int argc, char **argv) {
     printf("[TigerStyle] SendToy Starting (POSIX)...\n");
+
+    const char* target_ip = "255.255.255.255";
+    if (argc > 1) {
+        target_ip = argv[1];
+        printf("[TigerStyle] Targeting Peer IP: %s\n", target_ip);
+    }
 
     if (platform_init() != 0) {
         fprintf(stderr, "Failed to init platform\n");
@@ -237,8 +243,8 @@ int main(void) {
             
             // TigerStyle Output: Flush Outbox
             if (g_ctx.outbox_len > 0) {
-                 printf("DEBUG: UDP Broadcast %d bytes\n", g_ctx.outbox_len);
-                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, "255.255.255.255", g_ctx.config_target_port);
+                 printf("DEBUG: Sending %d bytes to %s\n", g_ctx.outbox_len, target_ip);
+                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, target_ip, g_ctx.config_target_port);
                  g_ctx.outbox_len = 0;
             }
         }
