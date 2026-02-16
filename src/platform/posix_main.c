@@ -231,6 +231,7 @@ int main(void) {
             
             // TigerStyle Output: Flush Outbox
             if (g_ctx.outbox_len > 0) {
+                 printf("DEBUG: UDP Broadcast %d bytes\n", g_ctx.outbox_len);
                  platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, "255.255.255.255", g_ctx.config_target_port);
                  g_ctx.outbox_len = 0;
             }
@@ -251,6 +252,7 @@ int main(void) {
                 int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
                 
                 if (bytes > 0) {
+                    printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
                     state_event_t net_ev;
                     net_ev.type = EVENT_NET_PACKET_RECEIVED;
                     net_ev.packet.data = g_net_rx_buffer;
