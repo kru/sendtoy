@@ -226,6 +226,7 @@ static void handle_io_request(PlatformSocket sock) {
                  if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT || 
                      g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
                      fname = g_ctx.jobs_active[i].filename;
+                     if (g_ctx.debug_enabled) printf("DEBUG: IO Read Fallback to Job %d File '%s'\n", i, fname);
                      break;
                  }
              }
@@ -269,8 +270,10 @@ static void handle_io_request(PlatformSocket sock) {
                     if (g_ctx.debug_enabled) printf("DEBUG: Sent DATA Offset %llu Len %llu to %s\n", g_ctx.io_req_offset, read, ip_str);
                 }
             } else {
-                printf("Error: Read IO failed for %s\n", fname);
+                printf("Error: Read IO failed for '%s'\n", fname);
             }
+        } else {
+             if (g_ctx.debug_enabled) printf("DEBUG: IO Read - No Active Job Found for ID %d\n", g_ctx.io_req_job_id);
         }
     } 
     else if (g_ctx.io_req_type == IO_WRITE_CHUNK) {
