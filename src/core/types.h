@@ -64,6 +64,26 @@ typedef struct TIGER_ALIGN(8) peer_advert {
 
 PRECISE_ASSERT(sizeof(peer_advert_t) == 40); // 32 + 4 + 2 + 2
 
+typedef struct TIGER_ALIGN(8) msg_offer {
+    u64 file_size;
+    u64 file_hash_low; // First 64 bits of hash for verification
+    u32 timestamp;
+    u32 name_len;
+    char name[256]; // Fixed buffer for simplicity
+} msg_offer_t;
+
+typedef struct TIGER_ALIGN(8) msg_request {
+    u32 job_id; // Sender's Job ID
+    u32 len;    
+    u64 offset;
+} msg_request_t;
+
+typedef struct TIGER_ALIGN(8) msg_data {
+    u32 job_id;
+    u64 offset;
+    // Data follows immediately after struct in the packet body
+} msg_data_t;
+
 // --- Internal State Structs ---
 
 typedef enum {
@@ -85,13 +105,16 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u64 start_time;
   u32 state; // job_state_e
   u32 id;
+  
+  // Filename for Platform IO
+  char filename[256];
 
   // Bitmap of completed blocks (1 = complete, 0 = missing)
   u64 block_bitmap[BITMAP_SIZE_U64];
 
   // Keep alignment to 64 bytes
-  // Current size: 32+32+8+8+8+4+4 + (1024*8) = 96 + 8192 = 8288 bytes.
-  // 8288 % 64 = 32. Need 32 bytes padding.
+  // Current size: 32+32+8+8+8+4+4 (96) + 256 + 8192 = 8544 bytes.
+  // 8544 % 64 = 32. Need 32 bytes padding.
   u8 padding[32];
 } transfer_job_t;
 
@@ -105,6 +128,13 @@ typedef struct TIGER_ALIGN(64) peer_entry {
   u64 last_seen_time;
 } peer_entry_t;
 
+// --- IO Interface (State -> Platform) ---
+typedef enum {
+    IO_NONE = 0,
+    IO_READ_CHUNK = 1,
+    IO_WRITE_CHUNK = 2
+} io_req_type_e;
+
 // --- Global Context ---
 
 typedef struct TIGER_ALIGN(64) ctx_main {
@@ -116,6 +146,16 @@ typedef struct TIGER_ALIGN(64) ctx_main {
   u16 config_listen_port;
   u16 config_target_port;
   u32 _padding_config;
+
+  // IO Request (Platform reads this after state_update)
+  u32 io_req_type;      // io_req_type_e
+  u32 io_req_job_id;
+  u64 io_req_offset;
+  u32 io_req_len;
+  u32 io_peer_ip;       // For sending data after read
+  u16 io_peer_port;
+  u32 _padding_io;
+  u8* io_data_ptr;      // Pointer to data for Write (Zero Copy from packet)
 
   // Discovery
   peer_entry_t peers_known[PEERS_MAX];
@@ -176,10 +216,13 @@ typedef struct {
       u32 from_ip;
       u16 from_port;
     } packet;
+    // User Command Data
     struct {
-      u32 type;
-      // potential user command data
-    } command;
+        u32 target_ip;
+        u64 file_size;
+        u64 file_hash_low;
+        char filename[256];
+    } cmd_send;
   };
 } state_event_t;
 

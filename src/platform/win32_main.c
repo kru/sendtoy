@@ -184,6 +184,120 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[1500]; // Standard MTU
 
+// TigerStyle: Handle IO Requests from State Machine
+static void handle_io_request(PlatformSocket sock) {
+    if (g_ctx.io_req_type == IO_NONE) return;
+
+    if (g_ctx.io_req_type == IO_READ_CHUNK) {
+        // Find filename
+        char* fname = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].state != JOB_STATE_FREE && 
+                 g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) { // Sender Job logic? 
+                 // Wait, receiver sends REQ with sender's job ID (if negotiated) or receiver's?
+                 // Current state.c uses 0 for MVP or random.
+                 // Let's assume for MVP: single active transfer, or linear search.
+                 fname = g_ctx.jobs_active[i].filename;
+                 break;
+             }
+        }
+        
+        // Fallback for MVP: If we can't match ID (because state.c logic for ID isn't fully robust yet), usage scan.
+        // Actually, state.c's `handle_command` sets a random ID. The REQ should carry it.
+        // But for the very first REQ from receiver, does receiver know the ID?
+        // Receiver sent REQ with job_id=0 in `handle_packet_offer`.
+        // Sender needs to handle job_id=0? Or lookup by filename?
+        // Sender `EVENT_USER_COMMAND` set a random ID.
+        // Receiver `OFFER` handler didn't know sender's ID, so it sent 0.
+        // Sender `REQ` handler needs to handle 0?
+        if (!fname) {
+             // Try to find ANY sender job
+             for (int i = 0; i < JOBS_MAX; ++i) {
+                 if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT || 
+                     g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+                     fname = g_ctx.jobs_active[i].filename;
+                     break;
+                 }
+             }
+        }
+
+        if (fname) {
+            FILE* f = fopen(fname, "rb");
+            if (f) {
+                fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
+                
+                packet_header_t header = {0};
+                header.magic = MAGIC_TOYS;
+                header.type = PACKET_TYPE_CHUNK_DATA;
+                
+                msg_data_t data_msg = {0};
+                data_msg.offset = g_ctx.io_req_offset;
+                data_msg.job_id = 0; // Sender ID?
+                
+                size_t headers_size = sizeof(packet_header_t) + sizeof(msg_data_t);
+                u8* ptr = g_ctx.outbox;
+                
+                // Read directly into outbox after headers
+                size_t read = fread(ptr + headers_size, 1, g_ctx.io_req_len, f);
+                fclose(f);
+                
+                if (read > 0) {
+                    header.body_length = sizeof(msg_data_t) + read;
+                    memcpy(ptr, &header, sizeof(packet_header_t));
+                    memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                    
+                    int sent = platform_udp_sendto(sock, g_ctx.outbox, headers_size + read, 
+                                        "255.255.255.255", // TODO: Use io_peer_ip
+                                        g_ctx.io_peer_port);
+                    // Hack for IP string
+                    char ip_str[64];
+                    struct in_addr addr;
+                    addr.s_addr = g_ctx.io_peer_ip;
+                    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+                    platform_udp_sendto(sock, g_ctx.outbox, headers_size + read, ip_str, g_ctx.io_peer_port);
+                    
+                    printf("DEBUG: Sent DATA Offset %llu Len %llu to %s\n", g_ctx.io_req_offset, read, ip_str);
+                }
+            } else {
+                printf("Error: Read IO failed for %s\n", fname);
+            }
+        }
+    } 
+    else if (g_ctx.io_req_type == IO_WRITE_CHUNK) {
+        // Find filename (Receiver Job)
+        // Similar lookup...
+        char* fname = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+                 fname = g_ctx.jobs_active[i].filename;
+                 break;
+             }
+        }
+        
+        if (fname) {
+            // "r+b" for updating, "wb" key to ensure creation if not exists?
+            // "r+b" fails if file doesn't exist. "wb" truncates.
+            // We need "Open if exists, else Create" without truncate.
+            // On Windows: `fopen` "ab"? No, that appends.
+            // Standard C `fopen` is tricky for "Open or Create".
+            // Try "r+b", if NULL, then "wb".
+            FILE* f = fopen(fname, "r+b");
+            if (!f) f = fopen(fname, "wb"); 
+            
+            if (f) {
+                fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
+                fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
+                fclose(f);
+                printf("DEBUG: Wrote Chunks %llu\n", g_ctx.io_req_offset);
+            } else {
+                printf("Error: Write IO failed for %s\n", fname);
+            }
+        }
+    }
+
+    g_ctx.io_req_type = IO_NONE; // Clear
+}
+
 int main(void) {
     printf("[TigerStyle] SendToy Starting...\n");
 
@@ -228,19 +342,92 @@ int main(void) {
 
     // 4. Main Loop
     u64 last_tick = platform_get_time_ms();
+    
+    // Console Input Buffer
+    char input_buf[256];
+    int input_pos = 0;
+
+    // Set Console Mode for non-blocking check?
+    // We'll use polling with kbhit-style logic or PeekConsoleInput
+    HANDLE hStdIn = GetStdHandle(STD_INPUT_HANDLE);
 
     while (1) {
         u64 now = platform_get_time_ms();
 
+        // 4a. Console Input (Simple Poll)
+        DWORD events = 0;
+        GetNumberOfConsoleInputEvents(hStdIn, &events);
+        if (events > 0) {
+            INPUT_RECORD record;
+            DWORD read;
+            if (PeekConsoleInputA(hStdIn, &record, 1, &read) && read > 0) {
+                if (record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
+                    ReadConsoleInputA(hStdIn, &record, 1, &read); // Consume
+                    char c = record.Event.KeyEvent.uChar.AsciiChar;
+                    if (c == '\r' || c == '\n') {
+                        if (input_pos > 0) {
+                            input_buf[input_pos] = 0;
+                            printf("\nCMD: %s\n", input_buf);
+                            
+                            // Parse "send <IP> <File>"
+                            char cmd[16], ip_str[64], fname[256];
+                            if (sscanf(input_buf, "%15s %63s %255s", cmd, ip_str, fname) == 3) {
+                                if (strcmp(cmd, "send") == 0) {
+                                    state_event_t ev;
+                                    ev.type = EVENT_USER_COMMAND;
+                                    
+                                    struct in_addr addr;
+                                    inet_pton(AF_INET, ip_str, &addr);
+                                    ev.cmd_send.target_ip = addr.s_addr;
+                                    
+                                    // Get File Size/Hash (Platform Job)
+                                    FILE* f = fopen(fname, "rb");
+                                    if (f) {
+                                        fseek(f, 0, SEEK_END);
+                                        ev.cmd_send.file_size = _ftelli64(f);
+                                        fclose(f);
+                                        strncpy(ev.cmd_send.filename, fname, 255);
+                                        ev.cmd_send.file_hash_low = 0xCAFEBABE; // Todo: Real Hash
+                                        
+                                        state_update(&g_ctx, &ev);
+                                    } else {
+                                        printf("Error: File not found: %s\n", fname);
+                                    }
+                                }
+                            }
+                            input_pos = 0;
+                        }
+                        printf("> ");
+                    } else if (c >= 32 && c <= 126 && input_pos < sizeof(input_buf) - 1) {
+                        input_buf[input_pos++] = c;
+                        printf("%c", c);
+                    } else if (c == 8 && input_pos > 0) { // Backspace
+                        input_pos--;
+                        printf("\b \b");
+                    }
+                } else {
+                     // Consume non-key events or key-up
+                     ReadConsoleInputA(hStdIn, &record, 1, &read);
+                }
+            }
+        }
+
+// TigerStyle: Handle IO Requests from State Machine
+
+
+// ... Main Loop ...
         // 4a. Tick Event
         if (now - last_tick >= 100) {
             state_event_t tick_ev;
             tick_ev.type = EVENT_TICK_100MS;
             state_update(&g_ctx, &tick_ev);
+            handle_io_request(udp_sock); // Handle IO
             last_tick = now;
             
-            // TigerStyle Output: Flush Outbox
+            // TigerStyle Output: Flush Outbox (Discovery packets)
             if (g_ctx.outbox_len > 0) {
+                 // ...
+
                  printf("DEBUG: Sending %d bytes to %s\n", g_ctx.outbox_len, target_ip);
                  platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, target_ip, g_ctx.config_target_port);
                  g_ctx.outbox_len = 0;

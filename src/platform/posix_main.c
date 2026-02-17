@@ -191,6 +191,94 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[1500];
 
+// TigerStyle: Handle IO Requests from State Machine
+static void handle_io_request(PlatformSocket sock) {
+    if (g_ctx.io_req_type == IO_NONE) return;
+
+    if (g_ctx.io_req_type == IO_READ_CHUNK) {
+        char* fname = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].state != JOB_STATE_FREE && 
+                 g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) { 
+                 fname = g_ctx.jobs_active[i].filename;
+                 break;
+             }
+        }
+        
+        if (!fname) {
+             for (int i = 0; i < JOBS_MAX; ++i) {
+                 if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT || 
+                     g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+                     fname = g_ctx.jobs_active[i].filename;
+                     break;
+                 }
+             }
+        }
+
+        if (fname) {
+            FILE* f = fopen(fname, "rb");
+            if (f) {
+                fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
+                
+                packet_header_t header = {0};
+                header.magic = MAGIC_TOYS;
+                header.type = PACKET_TYPE_CHUNK_DATA;
+                
+                msg_data_t data_msg = {0};
+                data_msg.offset = g_ctx.io_req_offset;
+                data_msg.job_id = 0; 
+                
+                size_t headers_size = sizeof(packet_header_t) + sizeof(msg_data_t);
+                u8* ptr = g_ctx.outbox;
+                
+                size_t read = fread(ptr + headers_size, 1, g_ctx.io_req_len, f);
+                fclose(f);
+                
+                if (read > 0) {
+                    header.body_length = sizeof(msg_data_t) + read;
+                    memcpy(ptr, &header, sizeof(packet_header_t));
+                    memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                    
+                    char ip_str[64];
+                    struct in_addr addr;
+                    addr.s_addr = g_ctx.io_peer_ip;
+                    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+                    platform_udp_sendto(sock, g_ctx.outbox, headers_size + read, ip_str, g_ctx.io_peer_port);
+                    
+                    printf("DEBUG: Sent DATA Offset %llu Len %zu to %s\n", g_ctx.io_req_offset, read, ip_str);
+                }
+            } else {
+                printf("Error: Read IO failed for %s\n", fname);
+            }
+        }
+    } 
+    else if (g_ctx.io_req_type == IO_WRITE_CHUNK) {
+        char* fname = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+                 fname = g_ctx.jobs_active[i].filename;
+                 break;
+             }
+        }
+        
+        if (fname) {
+            FILE* f = fopen(fname, "r+b");
+            if (!f) f = fopen(fname, "wb"); 
+            
+            if (f) {
+                fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
+                fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
+                fclose(f);
+                printf("DEBUG: Wrote Chunks %llu\n", g_ctx.io_req_offset);
+            } else {
+                printf("Error: Write IO failed for %s\n", fname);
+            }
+        }
+    }
+
+    g_ctx.io_req_type = IO_NONE; // Clear
+}
+
 int main(int argc, char **argv) {
     printf("[TigerStyle] SendToy Starting (POSIX)...\n");
 
@@ -234,11 +322,20 @@ int main(int argc, char **argv) {
     while (1) {
         u64 now = platform_get_time_ms();
 
+// TigerStyle: Handle IO Requests from State Machine
+
+
+    // Console Input Buffer
+    char input_buf[256];
+    int input_pos = 0;
+
+    // ... loop ...
         // 4a. Tick Event
         if (now - last_tick >= 100) {
             state_event_t tick_ev;
             tick_ev.type = EVENT_TICK_100MS;
             state_update(&g_ctx, &tick_ev);
+            handle_io_request(udp_sock);
             last_tick = now;
             
             // TigerStyle Output: Flush Outbox
@@ -249,22 +346,26 @@ int main(int argc, char **argv) {
             }
         }
 
-        // 4b. Network Poll (poll)
-        struct pollfd fds[1];
+        // 4b. Network Poll (poll) + Stdin Poll
+        struct pollfd fds[2];
         fds[0].fd = udp_sock;
         fds[0].events = POLLIN;
+        fds[1].fd = STDIN_FILENO;
+        fds[1].events = POLLIN;
         
         // Timeout 10ms
-        int ret = poll(fds, 1, 10);
+        int ret = poll(fds, 2, 10);
+
         
         if (ret > 0) {
+            // 1. Network
             if (fds[0].revents & POLLIN) {
                 char ip_str[64];
                 u16 port;
                 int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
                 
                 if (bytes > 0) {
-                    printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
+                    // printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
                     state_event_t net_ev;
                     net_ev.type = EVENT_NET_PACKET_RECEIVED;
                     net_ev.packet.data = g_net_rx_buffer;
@@ -279,6 +380,56 @@ int main(int argc, char **argv) {
                     }
 
                     state_update(&g_ctx, &net_ev);
+                }
+            }
+            
+            // 2. Console Input
+            if (fds[1].revents & POLLIN) {
+                char c;
+                if (read(STDIN_FILENO, &c, 1) > 0) {
+                     if (c == '\n') {
+                        if (input_pos > 0) {
+                            input_buf[input_pos] = 0;
+                            printf("CMD: %s\n", input_buf);
+                            
+                            // Parse "send <IP> <File>"
+                            char cmd[16], ip_str[64], fname[256];
+                            if (sscanf(input_buf, "%15s %63s %255s", cmd, ip_str, fname) == 3) {
+                                if (strcmp(cmd, "send") == 0) {
+                                    state_event_t ev;
+                                    ev.type = EVENT_USER_COMMAND;
+                                    
+                                    struct in_addr addr;
+                                    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                                        ev.cmd_send.target_ip = addr.s_addr;
+                                        
+                                        // Get File Size/Hash
+                                        FILE* f = fopen(fname, "rb");
+                                        if (f) {
+                                            fseek(f, 0, SEEK_END);
+                                            ev.cmd_send.file_size = (u64)ftell(f); // ftello for large files?
+                                            fclose(f);
+                                            strncpy(ev.cmd_send.filename, fname, 255);
+                                            ev.cmd_send.file_hash_low = 0xCAFEBABE; 
+                                            
+                                            state_update(&g_ctx, &ev);
+                                        } else {
+                                            printf("Error: File not found: %s\n", fname);
+                                        }
+                                    } else {
+                                        printf("Error: Invalid IP\n");
+                                    }
+                                }
+                            }
+                            input_pos = 0;
+                        }
+                        printf("> ");
+                        fflush(stdout);
+                     } else if (c >= 32 && c <= 126 && input_pos < sizeof(input_buf) - 1) {
+                        input_buf[input_pos++] = c;
+                        // printf("%c", c); // Local echo? Depends on terminal mode. 
+                        // Usually local echo is on, so we don't print.
+                     }
                 }
             }
         }
