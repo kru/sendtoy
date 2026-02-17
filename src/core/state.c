@@ -7,7 +7,7 @@
 static void handle_tick(ctx_main_t* ctx) {
     if (ctx->next_advert_time == 0) {
         // Init or timer fired
-        printf("DEBUG: Tick - Queueing Advert\n");
+        if (ctx->debug_enabled) printf("DEBUG: Tick - Queueing Advert\n");
         
         // 1. Build Advert
         peer_advert_t advert = {0};
@@ -35,13 +35,13 @@ static void handle_tick(ctx_main_t* ctx) {
 
 static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
     if (event->packet.len < sizeof(packet_header_t)) {
-        printf("DEBUG: Packet too short: %u\n", event->packet.len);
+        if (ctx->debug_enabled) printf("DEBUG: Packet too short: %u\n", event->packet.len);
         return; 
     }
     
     const packet_header_t* header = (const packet_header_t*)event->packet.data;
     if (header->magic != MAGIC_TOYS) {
-        printf("DEBUG: Invalid Magic: %08X\n", header->magic);
+        if (ctx->debug_enabled) printf("DEBUG: Invalid Magic: %08X\n", header->magic);
         return; 
     }
 
@@ -49,9 +49,9 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
     u32 body_len = event->packet.len - sizeof(packet_header_t);
 
     if (header->type == PACKET_TYPE_ADVERT) {
-        // printf("DEBUG: Recv ADVERT from IP: %08X\n", event->packet.from_ip);
+        if (ctx->debug_enabled) printf("DEBUG: Recv ADVERT from IP: %08X\n", event->packet.from_ip);
         if (body_len < sizeof(peer_advert_t)) {
-             printf("DEBUG: Advert body too short\n");
+             if (ctx->debug_enabled) printf("DEBUG: Advert body too short\n");
              return;
         }
         
@@ -59,7 +59,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
 
         // TigerStyle: Ignore self
         if (memcmp(advert->public_key, ctx->my_public_key, 32) == 0) {
-            // printf("DEBUG: Ignored own packet\n");
+            // if (ctx->debug_enabled) printf("DEBUG: Ignored own packet\n");
             return;
         }
         
@@ -71,14 +71,14 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
                 ctx->peers_known[i].last_seen_time = 1; 
                 memcpy(ctx->peers_known[i].public_key, advert->public_key, 32);
                 found = true;
-                printf("DEBUG: Updated peer %d\n", i);
+                // printf("DEBUG: Updated peer %d\n", i);
                 break;
             }
         }
         
         if (!found && ctx->peers_count < PEERS_MAX) {
             peer_entry_t* p = &ctx->peers_known[ctx->peers_count];
-            printf("DEBUG: New Peer Discovered! IP: %u\n", event->packet.from_ip);
+            if (ctx->debug_enabled) printf("DEBUG: New Peer Discovered! IP: %u\n", event->packet.from_ip);
             p->ip_address = event->packet.from_ip; 
             p->port = advert->port;
             p->last_seen_time = 1;
@@ -88,7 +88,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         if (body_len < sizeof(msg_offer_t)) return;
         const msg_offer_t* offer = (const msg_offer_t*)body;
         
-        printf("DEBUG: Recv OFFER File: %s Size: %llu\n", offer->name, offer->file_size);
+        if (ctx->debug_enabled) printf("DEBUG: Recv OFFER File: %s Size: %llu\n", offer->name, offer->file_size);
         
         // Find free job for Receiver
         for (int i = 0; i < JOBS_MAX; ++i) {
@@ -154,7 +154,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         ctx->io_peer_ip = event->packet.from_ip;
         ctx->io_peer_port = ctx->config_target_port; // Or from packet
         
-        printf("DEBUG: Recv REQ Offset %llu Len %u\n", req->offset, req->len);
+        if (ctx->debug_enabled) printf("DEBUG: Recv REQ Offset %llu Len %u\n", req->offset, req->len);
         
     } else if (header->type == PACKET_TYPE_CHUNK_DATA) {
         if (body_len < sizeof(msg_data_t)) return;
@@ -168,7 +168,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         ctx->io_req_len = data_len;
         ctx->io_data_ptr = (u8*)(body + sizeof(msg_data_t));
         
-        printf("DEBUG: Recv DATA Offset %llu Len %u\n", data_msg->offset, data_len);
+        if (ctx->debug_enabled) printf("DEBUG: Recv DATA Offset %llu Len %u\n", data_msg->offset, data_len);
         
         // Update Job Progress
         // Find Job (Receiver)
@@ -205,12 +205,12 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
                     ctx->io_peer_port = ctx->config_target_port;
                  }
              } else {
-                 printf("DEBUG: Transfer Complete!\n");
+                 if (ctx->debug_enabled) printf("DEBUG: Transfer Complete!\n");
                  job->state = JOB_STATE_COMPLETED;
              }
         }
     } else {
-        printf("DEBUG: Unknown packet type: %u\n", header->type);
+        if (ctx->debug_enabled) printf("DEBUG: Unknown packet type: %u\n", header->type);
     }
 }
 static void handle_tick(ctx_main_t* ctx);
@@ -225,6 +225,7 @@ void state_init(ctx_main_t* ctx) {
     }
     
     // Initialize defaults if any (e.g., random keys generation should happen here or be passed in)
+    ctx->debug_enabled = true;
 }
 
 bool state_update(ctx_main_t* ctx, const state_event_t* event) {
@@ -285,7 +286,7 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event) {
                         ctx->io_peer_port = ctx->config_target_port;
                     }
                     
-                    printf("DEBUG: Started Job %d (Offer Sent)\n", i);
+                    if (ctx->debug_enabled) printf("DEBUG: Started Job %d (Offer Sent)\n", i);
                     changed = true;
                     break;
                 }

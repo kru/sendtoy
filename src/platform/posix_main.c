@@ -245,7 +245,7 @@ static void handle_io_request(PlatformSocket sock) {
                     inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
                     platform_udp_sendto(sock, g_ctx.outbox, headers_size + read, ip_str, g_ctx.io_peer_port);
                     
-                    printf("DEBUG: Sent DATA Offset %llu Len %zu to %s\n", g_ctx.io_req_offset, read, ip_str);
+                    if (g_ctx.debug_enabled) printf("DEBUG: Sent DATA Offset %llu Len %zu to %s\n", g_ctx.io_req_offset, read, ip_str);
                 }
             } else {
                 printf("Error: Read IO failed for %s\n", fname);
@@ -269,7 +269,7 @@ static void handle_io_request(PlatformSocket sock) {
                 fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
                 fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
                 fclose(f);
-                printf("DEBUG: Wrote Chunks %llu\n", g_ctx.io_req_offset);
+                if (g_ctx.debug_enabled) printf("DEBUG: Wrote Chunks %llu\n", g_ctx.io_req_offset);
             } else {
                 printf("Error: Write IO failed for %s\n", fname);
             }
@@ -340,7 +340,7 @@ int main(int argc, char **argv) {
             
             // TigerStyle Output: Flush Outbox
             if (g_ctx.outbox_len > 0) {
-                 printf("DEBUG: Sending %d bytes to %s\n", g_ctx.outbox_len, target_ip);
+                 if (g_ctx.debug_enabled) printf("DEBUG: Sending %d bytes to %s\n", g_ctx.outbox_len, target_ip);
                  platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, target_ip, g_ctx.config_target_port);
                  g_ctx.outbox_len = 0;
             }
@@ -365,7 +365,7 @@ int main(int argc, char **argv) {
                 int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
                 
                 if (bytes > 0) {
-                    // printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
+                    if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
                     state_event_t net_ev;
                     net_ev.type = EVENT_NET_PACKET_RECEIVED;
                     net_ev.packet.data = g_net_rx_buffer;
@@ -392,32 +392,84 @@ int main(int argc, char **argv) {
                             input_buf[input_pos] = 0;
                             printf("CMD: %s\n", input_buf);
                             
-                            // Parse "send <IP> <File>"
-                            char cmd[16], ip_str[64], fname[256];
-                            if (sscanf(input_buf, "%15s %63s %255s", cmd, ip_str, fname) == 3) {
+                            // Parse "send <IP> <File>" manually to handle quotes/spaces
+                            char cmd[16] = {0};
+                            char ip_str[64] = {0};
+                            char fname[256] = {0};
+                            
+                            char* s = input_buf;
+                            
+                            // 1. Skip leading whitespace
+                            while (*s && *s <= 32) s++;
+                            
+                            // 2. Parse Command
+                            int i = 0;
+                            while (*s && *s > 32 && i < 15) cmd[i++] = *s++;
+                            cmd[i] = 0;
+                            
+                            // 3. Skip whitespace
+                            while (*s && *s <= 32) s++;
+                            
+                            // 4. Parse IP
+                            i = 0;
+                            while (*s && *s > 32 && i < 63) ip_str[i++] = *s++;
+                            ip_str[i] = 0;
+                            
+                            // 5. Skip whitespace
+                            while (*s && *s <= 32) s++;
+                            
+                            // 6. Parse Filename (Handle Quotes)
+                            if (*s == '\"') {
+                                s++; // Skip open quote
+                                i = 0;
+                                while (*s && *s != '\"' && i < 255) fname[i++] = *s++;
+                                if (*s == '\"') s++; // Skip close quote
+                            } else {
+                                i = 0;
+                                while (*s && *s >= 32 && i < 255) fname[i++] = *s++; // Take rest of line
+                                // Trim trailing whitespace?
+                                while (i > 0 && fname[i-1] <= 32) i--;
+                            }
+                            fname[i] = 0;
+
+                            if (cmd[0]) {
                                 if (strcmp(cmd, "send") == 0) {
-                                    state_event_t ev;
-                                    ev.type = EVENT_USER_COMMAND;
-                                    
-                                    struct in_addr addr;
-                                    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-                                        ev.cmd_send.target_ip = addr.s_addr;
+                                    if (ip_str[0] && fname[0]) {
+                                        state_event_t ev;
+                                        ev.type = EVENT_USER_COMMAND;
                                         
-                                        // Get File Size/Hash
-                                        FILE* f = fopen(fname, "rb");
-                                        if (f) {
-                                            fseek(f, 0, SEEK_END);
-                                            ev.cmd_send.file_size = (u64)ftell(f); // ftello for large files?
-                                            fclose(f);
-                                            strncpy(ev.cmd_send.filename, fname, 255);
-                                            ev.cmd_send.file_hash_low = 0xCAFEBABE; 
+                                        struct in_addr addr;
+                                        if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                                            ev.cmd_send.target_ip = addr.s_addr;
                                             
-                                            state_update(&g_ctx, &ev);
+                                            // Get File Size/Hash
+                                            FILE* f = fopen(fname, "rb");
+                                            if (f) {
+                                                fseek(f, 0, SEEK_END);
+                                                ev.cmd_send.file_size = (u64)ftell(f); // ftello for large files?
+                                                fclose(f);
+                                                strncpy(ev.cmd_send.filename, fname, 255);
+                                                ev.cmd_send.file_hash_low = 0xCAFEBABE; 
+                                                
+                                                state_update(&g_ctx, &ev);
+                                            } else {
+                                                printf("Error: File not found: %s\n", fname);
+                                            }
                                         } else {
-                                            printf("Error: File not found: %s\n", fname);
+                                            printf("Error: Invalid IP\n");
                                         }
                                     } else {
-                                        printf("Error: Invalid IP\n");
+                                        printf("Usage: send <IP> <File>\n");
+                                    }
+                                } else if (strcmp(cmd, "debug") == 0) {
+                                    if (strcmp(ip_str, "on") == 0 || strcmp(ip_str, "1") == 0) {
+                                        g_ctx.debug_enabled = true;
+                                        printf("Debug Mode: ON\n");
+                                    } else if (strcmp(ip_str, "off") == 0 || strcmp(ip_str, "0") == 0) {
+                                        g_ctx.debug_enabled = false;
+                                        printf("Debug Mode: OFF\n");
+                                    } else {
+                                        printf("Usage: debug <on|off>\n");
                                     }
                                 }
                             }

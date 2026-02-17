@@ -145,7 +145,8 @@ typedef struct TIGER_ALIGN(64) ctx_main {
   // Configuration
   u16 config_listen_port;
   u16 config_target_port;
-  u32 _padding_config;
+  bool debug_enabled;
+  u8 _padding_config[3];
 
   // IO Request (Platform reads this after state_update)
   u32 io_req_type;      // io_req_type_e
