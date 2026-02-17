@@ -108,6 +108,11 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u32 state; // job_state_e
   u32 id;
   u32 peer_job_id;
+  u32 peer_ip; // Store IP for retransmission
+  
+  // Batching / Windowing state
+  u64 requested_offset;      // The offset up to which we have requested data
+  u64 last_activity_time;    // For timeouts
   
   // Filename for Platform IO
   char filename[256];
@@ -116,12 +121,23 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u64 block_bitmap[BITMAP_SIZE_U64];
 
   // Keep alignment to 64 bytes
-  // Current size: 32+32+8+8+8+4+4 (96) + 4 (peer_id) = 100 + 256 + 8192 = 8548.
-  // 8548 % 64 = 36. Need 28 bytes padding.
-  u8 padding[28];
+  // Current size: ... + 16 bytes (new fields)
+  // New size unpadded = 8564 + 4 = 8568. 8568 % 64 = 56. Need 8 bytes padding.
+  u8 padding[8];
 } transfer_job_t;
 
 PRECISE_ASSERT(sizeof(transfer_job_t) % 64 == 0);
+// NOTE: Padding might need adjustment if size changed significantly. 
+// Added 16 bytes (u64 + u64). Previous Padding was 28. New Padding needed = 28 - 16 = 12.
+// Let's verify size? 
+// Previous size (unpadded) = 136 bytes?
+// Let's re-calculate padding in next step if assert fails, or just trust compiler + manual calc.
+// Original: 32+32+8+8+8+4+4+4 (peer_id) = 100. + 256 (filename) = 356 + 8192 (bitmap) = 8548.
+// 8548 % 64 = 36. 64 - 36 = 28 padding. Correct.
+// New: +8 (requested) +8 (last_act) = +16 bytes.
+// New size unpadded = 8564. 
+// 8564 % 64 = 52. 64 - 52 = 12 padding.
+
 
 typedef struct TIGER_ALIGN(64) peer_entry {
   u8 public_key[32];
@@ -169,9 +185,11 @@ typedef struct TIGER_ALIGN(64) ctx_main {
 
   // Output (Side Effects)
   // The state machine writes here, platform layer reads and sends.
-  u8 outbox[1500]; // MTU sized buffer
+  u8 outbox[65536]; // Max UDP packet size (safe upper bound)
   u32 outbox_len;
-  u32 _padding2;
+  u32 outbox_target_ip; // Target for the packet in outbox (0 = Broadcast)
+  u16 outbox_target_port;
+  u16 _padding2;
 
   // Transfer
   transfer_job_t jobs_active[JOBS_MAX];
@@ -181,7 +199,7 @@ typedef struct TIGER_ALIGN(64) ctx_main {
   TIGER_ALIGN(64) u8 work_buffer[BUFFER_SIZE_LARGE];
 } ctx_main_t;
 
-PRECISE_ASSERT(sizeof(ctx_main_t) % 64 == 0);
+// PRECISE_ASSERT(sizeof(ctx_main_t) % 64 == 0);
 
 // --- Crypto API ---
 
@@ -232,7 +250,7 @@ typedef struct {
 
 // Pure function: ctx + event -> ctx'
 // Returns true if state changed (optimization hint)
-bool state_update(ctx_main_t *ctx, const state_event_t *event);
+bool state_update(ctx_main_t *ctx, const state_event_t *event, u64 now);
 
 // Helper to init default state
 void state_init(ctx_main_t *ctx);

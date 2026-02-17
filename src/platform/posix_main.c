@@ -190,7 +190,7 @@ void platform_thread_join(PlatformThread *thread) {
 // Global Context (Statically allocated)
 static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
-static u8 g_net_rx_buffer[1500];
+static u8 g_net_rx_buffer[65536];
 
 // Helper to get Downloads path
 static void get_downloads_path(char* out_buf, size_t size) {
@@ -232,32 +232,56 @@ static void handle_io_request(PlatformSocket sock) {
             if (f) {
                 fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
                 
-                packet_header_t header = {0};
-                header.magic = MAGIC_TOYS;
-                header.type = PACKET_TYPE_CHUNK_DATA;
+                // Read into work_buffer (Up to 1MB)
+                // Ensure request fits in work_buffer (4MB)
+                size_t read_len = g_ctx.io_req_len;
+                if (read_len > sizeof(g_ctx.work_buffer)) read_len = sizeof(g_ctx.work_buffer);
                 
-                msg_data_t data_msg = {0};
-                data_msg.offset = g_ctx.io_req_offset;
-                data_msg.job_id = 0; 
-                
-                size_t headers_size = sizeof(packet_header_t) + sizeof(msg_data_t);
-                u8* ptr = g_ctx.outbox;
-                
-                size_t read = fread(ptr + headers_size, 1, g_ctx.io_req_len, f);
+                size_t read = fread(g_ctx.work_buffer, 1, read_len, f);
                 fclose(f);
                 
                 if (read > 0) {
-                    header.body_length = sizeof(msg_data_t) + read;
-                    memcpy(ptr, &header, sizeof(packet_header_t));
-                    memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                    // Burst Send Loop
+                    // Split into MTU sized chunks (e.g. 1400 bytes payload)
+                    const size_t CHUNK_MTU = 1400;
+                    size_t offset = 0;
                     
                     char ip_str[64];
                     struct in_addr addr;
                     addr.s_addr = g_ctx.io_peer_ip;
                     inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-                    platform_udp_sendto(sock, g_ctx.outbox, headers_size + read, ip_str, g_ctx.io_peer_port);
                     
-                    if (g_ctx.debug_enabled) printf("DEBUG: Sent DATA Offset %llu Len %zu to %s\n", g_ctx.io_req_offset, read, ip_str);
+                    while (offset < read) {
+                        size_t chunk_len = read - offset;
+                        if (chunk_len > CHUNK_MTU) chunk_len = CHUNK_MTU;
+                        
+                        packet_header_t header = {0};
+                        header.magic = MAGIC_TOYS;
+                        header.type = PACKET_TYPE_CHUNK_DATA;
+                        
+                        msg_data_t data_msg = {0};
+                        data_msg.offset = g_ctx.io_req_offset + offset;
+                        data_msg.job_id = 0; // Sender ID?
+                        
+                        header.body_length = sizeof(msg_data_t) + chunk_len;
+                        
+                        // Copy to outbox
+                        u8* ptr = g_ctx.outbox;
+                        memcpy(ptr, &header, sizeof(packet_header_t));
+                        memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                        memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
+                               g_ctx.work_buffer + offset, chunk_len);
+                               
+                        size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
+                        
+                        platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str, g_ctx.io_peer_port);
+                        
+                        offset += chunk_len;
+                        
+                        // Optional sleep/yield?
+                    }
+                    
+                    if (g_ctx.debug_enabled) printf("DEBUG: Burst Sent %zu bytes to %s\n", read, ip_str);
                 }
             } else {
                 printf("Error: Read IO failed for '%s'\n", fname);
@@ -361,15 +385,33 @@ int main(int argc, char **argv) {
         if (now - last_tick >= 100) {
             state_event_t tick_ev;
             tick_ev.type = EVENT_TICK_100MS;
-            state_update(&g_ctx, &tick_ev);
+            state_update(&g_ctx, &tick_ev, now);
             handle_io_request(udp_sock);
             last_tick = now;
             
             // TigerStyle Output: Flush Outbox
             if (g_ctx.outbox_len > 0) {
-                 if (g_ctx.debug_enabled) printf("DEBUG: Sending %d bytes to %s\n", g_ctx.outbox_len, target_ip);
-                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, target_ip, g_ctx.config_target_port);
+                 char ip_str[64] = "255.255.255.255";
+                 u16 target_port = g_ctx.config_target_port;
+                 
+                 if (g_ctx.outbox_target_ip != 0) {
+                      struct in_addr addr;
+                      addr.s_addr = g_ctx.outbox_target_ip;
+                      if (inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str))) {
+                          // Success
+                      }
+                      target_port = g_ctx.outbox_target_port;
+                 } else {
+                      // Broadcast (Default) for 0
+                      target_port = g_ctx.config_target_port; 
+                      if (g_ctx.outbox_target_port != 0) target_port = g_ctx.outbox_target_port;
+                 }
+
+                 if (g_ctx.debug_enabled) printf("DEBUG: Sending %u bytes to %s:%u\n", g_ctx.outbox_len, ip_str, target_port);
+                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, ip_str, target_port);
                  g_ctx.outbox_len = 0;
+                 g_ctx.outbox_target_ip = 0; // Reset
+                 g_ctx.outbox_target_port = 0;
             }
         }
 
@@ -406,7 +448,7 @@ int main(int argc, char **argv) {
                          net_ev.packet.from_ip = 0;
                     }
 
-                    state_update(&g_ctx, &net_ev);
+                    state_update(&g_ctx, &net_ev, platform_get_time_ms());
                 }
             }
             
@@ -478,7 +520,7 @@ int main(int argc, char **argv) {
                                                 strncpy(ev.cmd_send.filename, fname, 255);
                                                 ev.cmd_send.file_hash_low = 0xCAFEBABE; 
                                                 
-                                                state_update(&g_ctx, &ev);
+                                                state_update(&g_ctx, &ev, platform_get_time_ms());
                                             } else {
                                                 printf("Error: File not found: %s\n", fname);
                                             }

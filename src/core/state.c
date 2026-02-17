@@ -5,7 +5,64 @@
 
 // ... (rest of file)
 
-static void handle_tick(ctx_main_t* ctx) {
+static void handle_tick(ctx_main_t* ctx, u64 now) {
+    // 3. Reliability Check (Retransmission)
+    // Iterate active jobs (Receivers)
+    // We using a simple tick counter for time (1 tick = 100ms)
+    // Let's increment a global tick counter in context if we had one, 
+    // or just rely on 'now' passed in. 
+    // For now, let's assume 'now' is a monotonic tick counter from platform.
+    
+    for (int i = 0; i < JOBS_MAX; ++i) {
+        if (ctx->jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+             transfer_job_t* job = &ctx->jobs_active[i];
+             
+             // Check if stalled
+             if (job->bytes_transferred < job->requested_offset) {
+                 if (now - job->last_activity_time > 10) { // 1 second timeout (assuming 100ms ticks)
+                     if (ctx->debug_enabled) printf("DEBUG: Job %d Stalled. Re-requesting offset %llu\n", i, job->bytes_transferred);
+                     
+                     msg_request_t req = {0};
+                     req.job_id = job->peer_job_id;
+                     
+                     u64 remaining = job->file_size - job->bytes_transferred;
+                     u64 req_len = FILE_CHUNK_SIZE; 
+                     if (req_len > remaining) req_len = remaining;
+                     
+                     // We re-request from current position up to window size (or less)
+                     // Actually, if we just re-send the original request for the block:
+                     // The clamp in 'handle_packet' will handle it.
+                     // But we should request 'bytes_transferred' (the missing piece).
+                     
+                     req.offset = job->bytes_transferred;
+                     
+                     // Calculate length up to the NEXT block boundary or requested_offset
+                     // For simplicity, just request 'req_len' (1MB) from current position.
+                     // This might overlap or extend the window, which is fine.
+                     req.len = (u32)req_len; 
+                     
+                     job->requested_offset = req.offset + req_len; // Extend window if needed
+                     job->last_activity_time = now;
+                     
+                     packet_header_t req_header = {0};
+                     req_header.magic = MAGIC_TOYS;
+                     req_header.type = PACKET_TYPE_CHUNK_REQ;
+                     req_header.body_length = sizeof(msg_request_t);
+                     
+                     if (sizeof(packet_header_t) + sizeof(msg_request_t) <= sizeof(ctx->outbox)) {
+                        memcpy(ctx->outbox, &req_header, sizeof(packet_header_t));
+                        memcpy(ctx->outbox + sizeof(packet_header_t), &req, sizeof(msg_request_t));
+                        ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_request_t);
+                        
+                        // Set Target
+                        ctx->outbox_target_ip = job->peer_ip;
+                        ctx->outbox_target_port = ctx->config_target_port;
+                     }
+                 }
+             }
+        }
+    }
+
     if (ctx->next_advert_time == 0) {
         // Init or timer fired
         if (ctx->debug_enabled) printf("DEBUG: Tick - Queueing Advert\n");
@@ -26,15 +83,19 @@ static void handle_tick(ctx_main_t* ctx) {
             memcpy(ctx->outbox, &header, sizeof(packet_header_t));
             memcpy(ctx->outbox + sizeof(packet_header_t), &advert, sizeof(peer_advert_t));
             ctx->outbox_len = sizeof(packet_header_t) + sizeof(peer_advert_t);
+            ctx->outbox_target_ip = 0; // Broadcast
+            ctx->outbox_target_port = ctx->config_listen_port; // Adverts go to listen port usually? Or 9000?
+            // Adverts are usually broadcast to local subnet on 'config_listen_port' or specific discovery port?
+            // Existing logic relies on platform to broadcast.
         }
         
-        ctx->next_advert_time = 10; // 10 ticks = 1 second
+        ctx->next_advert_time = 10; // 1 second
     } else {
         ctx->next_advert_time--;
     }
 }
 
-static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
+static void handle_packet(ctx_main_t* ctx, const state_event_t* event, u64 now) {
     if (event->packet.len < sizeof(packet_header_t)) {
         if (ctx->debug_enabled) printf("DEBUG: Packet too short: %u\n", event->packet.len);
         return; 
@@ -91,6 +152,21 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         
         if (ctx->debug_enabled) printf("DEBUG: Recv OFFER File: %s Size: %llu\n", offer->name, offer->file_size);
         
+        // Check if this is a reflection of our own Offer
+        bool is_reflection = false;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+            if (ctx->jobs_active[i].state == JOB_STATE_OFFER_SENT && 
+                ctx->jobs_active[i].id == offer->job_id) {
+                is_reflection = true;
+                break;
+            }
+        }
+        
+        if (is_reflection) {
+             if (ctx->debug_enabled) printf("DEBUG: Ignored own OFFER reflection\n");
+             return;
+        }
+
         // Find free job for Receiver
         for (int i = 0; i < JOBS_MAX; ++i) {
              if (ctx->jobs_active[i].state == JOB_STATE_FREE) {
@@ -98,12 +174,12 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
                   job->state = JOB_STATE_TRANSFERRING;
                   // receiver job? we need to distinguish sender/receiver in job struct?
                   // For now, implicit: if we have file_size but bytes_transferred < size, we are working.
-                  // But wait, sender also has these.
                   // Let's assume OFFER reception implies we are Sink.
                   job->file_size = offer->file_size;
                   job->file_hash[0] = (u8)offer->file_hash_low;
                   job->bytes_transferred = 0;
                   job->peer_job_id = offer->job_id;
+                  job->peer_ip = event->packet.from_ip; // Store IP
                   
                   // Store Filename
                   u32 fname_len = offer->name_len;
@@ -111,11 +187,17 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
                   memcpy(job->filename, offer->name, fname_len);
                   job->filename[fname_len] = 0;
                   
-                  // Immediately Request First Chunk (Offset 0)
+                  // Request First Chunk (Batched)
                   msg_request_t req = {0};
                   req.job_id = job->peer_job_id;
-                  req.len = 1024; // 1KB chunks for MVP
+                  
+                  u64 req_len = FILE_CHUNK_SIZE;
+                  if (req_len > job->file_size) req_len = job->file_size;
+                  req.len = (u32)req_len;
                   req.offset = 0;
+                  
+                  job->requested_offset = req_len;
+                  job->last_activity_time = 0; // Reset
                   
                   packet_header_t req_header = {0};
                   req_header.magic = MAGIC_TOYS;
@@ -128,10 +210,8 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
                      ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_request_t);
                      
                      // Respond to sender
-                     ctx->io_peer_ip = event->packet.from_ip;
-                     ctx->io_peer_port = event->packet.from_port; // Or configured target port?
-                     // Usually respond to sender's port if UDP hole punching, but here we use fixed config port for simplicity
-                     ctx->io_peer_port = ctx->config_target_port;
+                     ctx->outbox_target_ip = event->packet.from_ip;
+                     ctx->outbox_target_port = ctx->config_target_port;
                   }
                   break;
               }
@@ -161,7 +241,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         ctx->io_req_job_id = job->id;
         ctx->io_req_offset = req->offset;
         ctx->io_req_len = req->len;
-        if (ctx->io_req_len > 1024) ctx->io_req_len = 1024; // Clamp
+        if (ctx->io_req_len > FILE_CHUNK_SIZE) ctx->io_req_len = FILE_CHUNK_SIZE; // Clamp to 1MB
         
         ctx->io_peer_ip = event->packet.from_ip;
         ctx->io_peer_port = ctx->config_target_port; // Or from packet
@@ -195,26 +275,39 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         
         if (job) {
              job->bytes_transferred += data_len;
+             job->last_activity_time = now;
              
-             // Request Next Chunk immediately if not done
+             // Request Next Chunk ONLY if we completed the current window
+             // Or if we are done
+             
              if (job->bytes_transferred < job->file_size) {
-                 msg_request_t req = {0};
-                 req.job_id = job->peer_job_id;
-                 req.len = 1024;
-                 req.offset = data_msg->offset + data_len;
-                 
-                 packet_header_t req_header = {0};
-                 req_header.magic = MAGIC_TOYS;
-                 req_header.type = PACKET_TYPE_CHUNK_REQ;
-                 req_header.body_length = sizeof(msg_request_t);
-                 
-                 if (sizeof(packet_header_t) + sizeof(msg_request_t) <= sizeof(ctx->outbox)) {
-                    memcpy(ctx->outbox, &req_header, sizeof(packet_header_t));
-                    memcpy(ctx->outbox + sizeof(packet_header_t), &req, sizeof(msg_request_t));
-                    ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_request_t);
-                    
-                    ctx->io_peer_ip = event->packet.from_ip; 
-                    ctx->io_peer_port = ctx->config_target_port;
+                 if (job->bytes_transferred >= job->requested_offset) {
+                     // Window finished, request next batch
+                     msg_request_t req = {0};
+                     req.job_id = job->peer_job_id;
+                     
+                     u64 remaining = job->file_size - job->bytes_transferred;
+                     u64 req_len = FILE_CHUNK_SIZE;
+                     if (req_len > remaining) req_len = remaining;
+                     
+                     req.len = (u32)req_len;
+                     req.offset = job->bytes_transferred;
+                     
+                     job->requested_offset = job->bytes_transferred + req_len;
+                     
+                     packet_header_t req_header = {0};
+                     req_header.magic = MAGIC_TOYS;
+                     req_header.type = PACKET_TYPE_CHUNK_REQ;
+                     req_header.body_length = sizeof(msg_request_t);
+                     
+                     if (sizeof(packet_header_t) + sizeof(msg_request_t) <= sizeof(ctx->outbox)) {
+                        memcpy(ctx->outbox, &req_header, sizeof(packet_header_t));
+                        memcpy(ctx->outbox + sizeof(packet_header_t), &req, sizeof(msg_request_t));
+                        ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_request_t);
+                        
+                        ctx->outbox_target_ip = event->packet.from_ip; 
+                        ctx->outbox_target_port = ctx->config_target_port;
+                     }
                  }
              } else {
                  if (ctx->debug_enabled) printf("DEBUG: Transfer Complete!\n");
@@ -225,8 +318,8 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         if (ctx->debug_enabled) printf("DEBUG: Unknown packet type: %u\n", header->type);
     }
 }
-static void handle_tick(ctx_main_t* ctx);
-static void handle_packet(ctx_main_t* ctx, const state_event_t* event);
+static void handle_tick(ctx_main_t* ctx, u64 now);
+static void handle_packet(ctx_main_t* ctx, const state_event_t* event, u64 now);
 static void handle_advert(ctx_main_t* ctx, const peer_advert_t* advert);
 
 void state_init(ctx_main_t* ctx) {
@@ -251,7 +344,7 @@ static const char* get_basename(const char* path) {
     return base;
 }
 
-bool state_update(ctx_main_t* ctx, const state_event_t* event) {
+bool state_update(ctx_main_t* ctx, const state_event_t* event, u64 now) {
     bool changed = false;
 
     switch (event->type) {
@@ -261,12 +354,14 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event) {
             break;
             
         case EVENT_TICK_100MS:
-            handle_tick(ctx);
+            handle_tick(ctx, now);
             changed = true; // Assume tick always potentially changes time-based state
             break;
             
         case EVENT_NET_PACKET_RECEIVED:
-            handle_packet(ctx, event);
+            handle_packet(ctx, event, now);
+            changed = true;
+            break;
             changed = true;
             break;
             
@@ -309,8 +404,8 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event) {
                         ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_offer_t);
                         
                         // Set IO target for the immediate send
-                        ctx->io_peer_ip = event->cmd_send.target_ip;
-                        ctx->io_peer_port = ctx->config_target_port;
+                        ctx->outbox_target_ip = event->cmd_send.target_ip;
+                        ctx->outbox_target_port = ctx->config_target_port;
                     }
                     
                     if (ctx->debug_enabled) printf("DEBUG: Started Job %d (Offer Sent)\n", i);

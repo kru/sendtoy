@@ -62,13 +62,14 @@ void test_discovery() {
     state_event_t evt_tick = {0};
     evt_tick.type = EVENT_TICK_100MS;
     
-    state_update(&ctx, &evt_tick);
+    state_update(&ctx, &evt_tick, 0);
     
     // Verify Outbox has ADVERT
     TEST_ASSERT(ctx.outbox_len > 0);
     packet_header_t* head = (packet_header_t*)ctx.outbox;
     TEST_ASSERT(head->magic == MAGIC_TOYS);
     TEST_ASSERT(head->type == PACKET_TYPE_ADVERT);
+    TEST_ASSERT(ctx.outbox_target_ip == 0); // Broadcast
     
     // 2. Receive ADVERT
     // Construct an advert packet from "another peer"
@@ -89,7 +90,7 @@ void test_discovery() {
     evt_net.packet.from_ip = 0x01020304; // 1.2.3.4
     evt_net.packet.from_port = 9001;
     
-    state_update(&ctx, &evt_net);
+    state_update(&ctx, &evt_net, 0);
     
     // Verify Peer Added
     TEST_ASSERT(ctx.peers_count == 1);
@@ -113,7 +114,7 @@ void test_transfer_sender() {
     evt.cmd_send.file_size = 5000; // 5KB
     evt.cmd_send.target_ip = 0x0A000001;
     
-    state_update(&ctx, &evt);
+    state_update(&ctx, &evt, 0);
     
     // 1. Verify Job Created
     int job_idx = -1;
@@ -130,6 +131,7 @@ void test_transfer_sender() {
     TEST_ASSERT(ctx.outbox_len > 0);
     packet_header_t* head = (packet_header_t*)ctx.outbox;
     TEST_ASSERT(head->type == PACKET_TYPE_OFFER);
+    TEST_ASSERT(ctx.outbox_target_ip == 0x0A000001); // Target IP
     
     msg_offer_t* offer = (msg_offer_t*)(ctx.outbox + sizeof(packet_header_t));
     printf("DEBUG Check: Offer Name '%s' JobID %u\n", offer->name, offer->job_id);
@@ -166,7 +168,7 @@ void test_transfer_receiver() {
     evt.packet.len = sizeof(packet_header_t) + sizeof(msg_offer_t);
     evt.packet.from_ip = 0x0B000002;
     
-    state_update(&ctx, &evt);
+    state_update(&ctx, &evt, 0);
     
     // 1. Verify Job Created
     int job_idx = -1;
@@ -184,6 +186,7 @@ void test_transfer_receiver() {
     TEST_ASSERT(ctx.outbox_len > 0);
     packet_header_t* out_head = (packet_header_t*)ctx.outbox;
     TEST_ASSERT(out_head->type == PACKET_TYPE_CHUNK_REQ);
+    TEST_ASSERT(ctx.outbox_target_ip == 0x0B000002); // Sender IP
     
     msg_request_t* req = (msg_request_t*)(ctx.outbox + sizeof(packet_header_t));
     TEST_ASSERT(req->job_id == 999);
