@@ -329,6 +329,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event, u64 now) 
 static void handle_tick(ctx_main_t* ctx, u64 now);
 static void handle_packet(ctx_main_t* ctx, const state_event_t* event, u64 now);
 static void handle_advert(ctx_main_t* ctx, const peer_advert_t* advert);
+static const char* get_basename(const char* path);
 
 void state_init(ctx_main_t* ctx) {
     // Zero out the entire context for safety
@@ -342,6 +343,230 @@ void state_init(ctx_main_t* ctx) {
 }
 
 // Helper to extract filename from path (handles / and \)
+// --- TCP Handlers ---
+
+static void handle_tcp_connected(ctx_main_t* ctx, u64 socket, bool success) {
+    transfer_job_t* job = NULL;
+    // Find Sender Job (Connecting)
+    for (int i = 0; i < JOBS_MAX; ++i) {
+        if (ctx->jobs_active[i].state == JOB_STATE_CONNECTING) {
+            job = &ctx->jobs_active[i];
+            break;
+        }
+    }
+    
+    if (!success) {
+        if (job) {
+             job->state = JOB_STATE_FAILED;
+             if (ctx->debug_enabled) printf("DEBUG: TCP Connect Failed for Job %d\n", job->id);
+        }
+        return;
+    }
+    
+    if (job) {
+        // Outgoing Connection Established (Sender)
+        job->state = JOB_STATE_HANDSHAKE;
+        job->tcp_socket = socket;
+        if (ctx->debug_enabled) printf("DEBUG: TCP Connected (Sender). Sending HELLO.\n");
+        
+        // Send HELLO (Handshake)
+        packet_header_t head = {
+            .magic = MAGIC_TOYS,
+            .type = PACKET_TYPE_HELLO,
+            .body_length = 32, // Public Key
+            .checksum = 0 // TODO
+        };
+        
+        memcpy(ctx->work_buffer, &head, sizeof(head));
+        memcpy(ctx->work_buffer + sizeof(head), ctx->my_public_key, 32);
+        
+        ctx->io_req_type = IO_TCP_SEND;
+        ctx->io_req_job_id = job->id;
+        ctx->io_req_len = sizeof(head) + 32;
+        ctx->io_data_ptr = ctx->work_buffer;
+    } else {
+        // Incoming Connection (Receiver)
+        // Create new Job
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (ctx->jobs_active[i].state == JOB_STATE_FREE) {
+                 job = &ctx->jobs_active[i];
+                 memset(job, 0, sizeof(transfer_job_t));
+                 job->id = (u32)(i + 1 + (ctx->next_advert_time & 0xFFFF)); // Random-ish ID
+                 job->state = JOB_STATE_HANDSHAKE;
+                 job->tcp_socket = socket;
+                 job->start_time = ctx->next_advert_time; // Approx
+                 if (ctx->debug_enabled) printf("DEBUG: TCP Inbound (Receiver) Job %d\n", job->id);
+                 break;
+             }
+        }
+        
+        if (!job) {
+            if (ctx->debug_enabled) printf("DEBUG: No free jobs for incoming TCP\n");
+            // IO_TCP_CLOSE (Not Implemented yet in this snippet, but platform should close if we return nothing?)
+            // We should explicit close.
+            // ctx->io_req_type = IO_TCP_CLOSE;
+            return;
+        }
+    }
+}
+
+static void handle_tcp_closed(ctx_main_t* ctx, u64 socket) {
+     for (int i = 0; i < JOBS_MAX; ++i) {
+        if (ctx->jobs_active[i].tcp_socket == socket && ctx->jobs_active[i].state != JOB_STATE_FREE) {
+            if (ctx->debug_enabled) printf("DEBUG: TCP Closed for Job %d\n", ctx->jobs_active[i].id);
+            ctx->jobs_active[i].state = JOB_STATE_FAILED;
+            ctx->jobs_active[i].tcp_socket = 0;
+        }
+    }
+}
+
+static void handle_tcp_data(ctx_main_t* ctx, u64 socket, u8* data, u32 len) {
+    transfer_job_t* job = NULL;
+    for (int i = 0; i < JOBS_MAX; ++i) {
+        if (ctx->jobs_active[i].tcp_socket == socket) {
+            job = &ctx->jobs_active[i];
+            break;
+        }
+    }
+    
+    if (!job) return;
+    
+    if (job->state == JOB_STATE_HANDSHAKE) {
+        if (len < sizeof(packet_header_t) + 32) return;
+        
+        packet_header_t* head = (packet_header_t*)data;
+        if (head->magic != MAGIC_TOYS || head->type != PACKET_TYPE_HELLO) {
+             if (ctx->debug_enabled) printf("DEBUG: Invalid Handshake\n");
+             return;
+        }
+        
+        u8* peer_pub = data + sizeof(packet_header_t);
+        memcpy(job->peer_key, peer_pub, 32);
+        
+        // Derive Shared Secret (Static-Static or Static-Eph depending on impl)
+        // Using MyPrivate + PeerPublic (from handshake)
+        crypto_shared_secret(job->shared_key, ctx->my_private_key, peer_pub);
+        if (ctx->debug_enabled) printf("DEBUG: Handshake Complete.\n");
+        
+        if (job->peer_ip == 0) {
+             // Receiver: Respond with HELLO
+             packet_header_t resp = {
+                .magic = MAGIC_TOYS,
+                .type = PACKET_TYPE_HELLO,
+                .body_length = 32
+             };
+             memcpy(ctx->work_buffer, &resp, sizeof(resp));
+             memcpy(ctx->work_buffer + sizeof(resp), ctx->my_public_key, 32);
+             
+             ctx->io_req_type = IO_TCP_SEND;
+             ctx->io_req_job_id = job->id;
+             ctx->io_req_len = sizeof(resp) + 32;
+             ctx->io_data_ptr = ctx->work_buffer;
+             
+             job->state = JOB_STATE_TRANSFERRING; // Ready for OFFER
+        } else {
+             // Sender: Send OFFER
+             msg_offer_t offer = {0};
+             offer.file_size = job->file_size;
+             offer.job_id = job->id;
+             const char* base_name = get_basename(job->filename);
+             u32 name_len = (u32)strlen(base_name);
+             if (name_len > 255) name_len = 255;
+             memcpy(offer.name, base_name, name_len);
+             offer.name_len = name_len;
+             
+             packet_header_t opkt = {
+                 .magic = MAGIC_TOYS,
+                 .type = PACKET_TYPE_OFFER,
+                 .body_length = sizeof(msg_offer_t)
+             };
+             
+             memcpy(ctx->work_buffer, &opkt, sizeof(opkt));
+             memcpy(ctx->work_buffer + sizeof(opkt), &offer, sizeof(offer));
+             
+             ctx->io_req_type = IO_TCP_SEND;
+             ctx->io_req_job_id = job->id;
+             ctx->io_req_len = sizeof(opkt) + sizeof(offer);
+             ctx->io_data_ptr = ctx->work_buffer;
+             
+             job->state = JOB_STATE_TRANSFERRING;
+        }
+    } else if (job->state == JOB_STATE_TRANSFERRING) {
+        packet_header_t* head = (packet_header_t*)data;
+        if (head->magic != MAGIC_TOYS) return;
+        
+        if (head->type == PACKET_TYPE_OFFER) {
+             msg_offer_t* offer = (msg_offer_t*)(data + sizeof(packet_header_t));
+             if (ctx->debug_enabled) printf("DEBUG: Recv OFFER (TCP) '%s' size %llu\n", offer->name, offer->file_size);
+             
+             job->file_size = offer->file_size;
+             job->peer_job_id = offer->job_id;
+             memcpy(job->filename, offer->name, offer->name_len);
+             job->filename[offer->name_len] = 0;
+             
+             // Send REQ (Offset 0, Len Max to start stream)
+             msg_request_t req = { .job_id = offer->job_id, .offset = 0, .len = 0xFFFFFFFF };
+             packet_header_t rpkt = { .magic = MAGIC_TOYS, .type = PACKET_TYPE_CHUNK_REQ, .body_length = sizeof(req) };
+             
+             memcpy(ctx->work_buffer, &rpkt, sizeof(rpkt));
+             memcpy(ctx->work_buffer + sizeof(rpkt), &req, sizeof(req));
+             
+             ctx->io_req_type = IO_TCP_SEND;
+             ctx->io_req_job_id = job->id;
+             ctx->io_req_len = sizeof(rpkt) + sizeof(req);
+             ctx->io_data_ptr = ctx->work_buffer;
+             
+        } else if (head->type == PACKET_TYPE_CHUNK_REQ) {
+             msg_request_t* req = (msg_request_t*)(data + sizeof(packet_header_t));
+             if (ctx->debug_enabled) printf("DEBUG: Recv REQ (TCP) Offset %llu\n", req->offset);
+             
+             // Start Stream (Read first chunk)
+             // We reuse IO_READ_CHUNK, but Platform needs to know to Send via TCP.
+             // We can check job->tcp_socket in Platform.
+             ctx->io_req_type = IO_READ_CHUNK;
+             ctx->io_req_job_id = job->id;
+             ctx->io_req_offset = req->offset;
+             ctx->io_req_len = FILE_CHUNK_SIZE;
+             
+             if (ctx->io_req_len > job->file_size - req->offset) {
+                 ctx->io_req_len = (u32)(job->file_size - req->offset);
+             }
+        } else if (head->type == PACKET_TYPE_CHUNK_DATA) {
+             // Receiver got Data
+             // Write to disk
+             // ... This requires implementation. UDP used IO_WRITE_CHUNK.
+             // TCP data comes in `data` buffer.
+             // But Wait! `handle_tcp_data` gets `data` buffer.
+             // We can just trigger `IO_WRITE_CHUNK` with this pointer.
+             
+             // Problem: `data` contains Header + Body.
+             // We need to point to Body.
+             // Also we need `msg_data_t`?
+             // Actually, for TCP Stream, do we need `msg_data_t` (Offset)? 
+             // Yes, for validation/seek?
+             // Or can we stream raw bytes?
+             // "Zero-Copy Data Path... 2. Hash... 3. Write".
+             // If we send `PACKET_TYPE_CHUNK_DATA` wrapping the chunk:
+             // [Header][msg_data_t][Raw Bytes...]
+             
+             // So:
+             if (len < sizeof(packet_header_t) + sizeof(msg_data_t)) return;
+             msg_data_t* data_msg = (msg_data_t*)(data + sizeof(packet_header_t));
+             u8* raw_bytes = data + sizeof(packet_header_t) + sizeof(msg_data_t);
+             u32 raw_len = len - (sizeof(packet_header_t) + sizeof(msg_data_t));
+             
+             ctx->io_req_type = IO_WRITE_CHUNK;
+             ctx->io_req_offset = data_msg->offset;
+             ctx->io_req_len = raw_len;
+             ctx->io_data_ptr = raw_bytes;
+             
+             job->bytes_transferred += raw_len;
+             
+             if (ctx->debug_enabled) printf("DEBUG: Recv TCP Data %u bytes. Total %llu\n", raw_len, job->bytes_transferred);
+        }
+    }
+}
+
 static const char* get_basename(const char* path) {
     const char* base = path;
     for (const char* p = path; *p; p++) {
@@ -373,50 +598,44 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event, u64 now) {
             changed = true;
             break;
             
+        case EVENT_TCP_CONNECTED:
+            handle_tcp_connected(ctx, event->tcp.socket, event->tcp.success);
+            changed = true;
+            break;
+            
+        case EVENT_TCP_DATA:
+            handle_tcp_data(ctx, event->tcp.socket, event->tcp.data, event->tcp.len);
+            changed = true;
+            break;
+            
+        case EVENT_TCP_CLOSED:
+            handle_tcp_closed(ctx, event->tcp.socket);
+            changed = true;
+            break;
+
         case EVENT_USER_COMMAND:
-            // Find free job
+            // Find free job for Sender
             for (int i = 0; i < JOBS_MAX; ++i) {
                 if (ctx->jobs_active[i].state == JOB_STATE_FREE) {
                     transfer_job_t* job = &ctx->jobs_active[i];
-                    job->state = JOB_STATE_OFFER_SENT;
-                    job->id = (u32)rand(); // Simple ID for now
+                    memset(job, 0, sizeof(transfer_job_t));
+                    job->state = JOB_STATE_CONNECTING;
+                    job->id = (u32)rand();
                     job->file_size = event->cmd_send.file_size;
-                    job->file_hash[0] = (u8)event->cmd_send.file_hash_low; // Partial hash store
                     
-                    // Store Filename
                     u32 fname_len = (u32)strlen(event->cmd_send.filename);
                     if (fname_len > 255) fname_len = 255;
                     memcpy(job->filename, event->cmd_send.filename, fname_len);
-                    job->filename[fname_len] = 0; // Null terminate
+                    job->filename[fname_len] = 0;
+                    job->peer_ip = event->cmd_send.target_ip;
                     
-                    // Build OFFER Packet
-                    msg_offer_t offer = {0};
-                    offer.file_size = event->cmd_send.file_size;
-                    offer.file_hash_low = event->cmd_send.file_hash_low;
-                    offer.job_id = job->id;
+                    // Trigger TCP Connect
+                    ctx->io_req_type = IO_TCP_CONNECT;
+                    ctx->io_peer_ip = job->peer_ip;
+                    ctx->io_peer_port = ctx->config_target_port;
+                    ctx->io_req_job_id = job->id;
                     
-                    const char* base_name = get_basename(event->cmd_send.filename);
-                    offer.name_len = (u32)strlen(base_name);
-                    
-                    if (offer.name_len > 255) offer.name_len = 255;
-                    memcpy(offer.name, base_name, offer.name_len);
-                    
-                    packet_header_t header = {0};
-                    header.magic = MAGIC_TOYS;
-                    header.type = PACKET_TYPE_OFFER;
-                    header.body_length = sizeof(msg_offer_t);
-                    
-                    if (sizeof(packet_header_t) + sizeof(msg_offer_t) <= sizeof(ctx->outbox)) {
-                        memcpy(ctx->outbox, &header, sizeof(packet_header_t));
-                        memcpy(ctx->outbox + sizeof(packet_header_t), &offer, sizeof(msg_offer_t));
-                        ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_offer_t);
-                        
-                        // Set IO target for the immediate send
-                        ctx->outbox_target_ip = event->cmd_send.target_ip;
-                        ctx->outbox_target_port = ctx->config_target_port;
-                    }
-                    
-                    if (ctx->debug_enabled) printf("DEBUG: Started Job %d (Offer Sent)\n", i);
+                    if (ctx->debug_enabled) printf("DEBUG: Job %d Connecting to %u...\n", job->id, job->peer_ip);
                     changed = true;
                     break;
                 }

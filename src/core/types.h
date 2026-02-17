@@ -93,7 +93,10 @@ typedef enum {
   JOB_STATE_OFFER_SENT = 1,
   JOB_STATE_TRANSFERRING = 2,
   JOB_STATE_COMPLETED = 3,
-  JOB_STATE_FAILED = 4
+  JOB_STATE_FAILED = 4,
+  // TCP States
+  JOB_STATE_CONNECTING = 5,
+  JOB_STATE_HANDSHAKE = 6
 } job_state_e;
 
 // Bitmap for tracking blocks. 64k blocks / 64 bits per u64 = 1024 u64s.
@@ -110,6 +113,12 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u32 peer_job_id;
   u32 peer_ip; // Store IP for retransmission
   
+  // TCP / Encryption State
+  u64 tcp_socket;      // Platform socket handle
+  u8 shared_key[32];   // Session key (X25519 derived)
+  u8 nonce_tx[24];     // Outgoing nonce
+  u8 nonce_rx[24];     // Incoming nonce
+  
   // Batching / Windowing state
   u64 requested_offset;      // The offset up to which we have requested data
   u64 last_activity_time;    // For timeouts
@@ -121,22 +130,16 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u64 block_bitmap[BITMAP_SIZE_U64];
 
   // Keep alignment to 64 bytes
-  // Current size: ... + 16 bytes (new fields)
-  // New size unpadded = 8564 + 4 = 8568. 8568 % 64 = 56. Need 8 bytes padding.
-  u8 padding[8];
+  // New fields: u64 (8) + 32 + 24 + 24 = 88 bytes.
+  // Previous padding was 8 bytes.
+  // Total Unpadded Size calculation:
+  // Base (approx 100) + Filename (256) + Bitmap (8192) + New (88) = 8656 bytes (approx).
+  // 8656 % 64 = 16. 
+  // 64 - 16 = 48 bytes padding needed.
+  u8 padding[48]; 
 } transfer_job_t;
 
 PRECISE_ASSERT(sizeof(transfer_job_t) % 64 == 0);
-// NOTE: Padding might need adjustment if size changed significantly. 
-// Added 16 bytes (u64 + u64). Previous Padding was 28. New Padding needed = 28 - 16 = 12.
-// Let's verify size? 
-// Previous size (unpadded) = 136 bytes?
-// Let's re-calculate padding in next step if assert fails, or just trust compiler + manual calc.
-// Original: 32+32+8+8+8+4+4+4 (peer_id) = 100. + 256 (filename) = 356 + 8192 (bitmap) = 8548.
-// 8548 % 64 = 36. 64 - 36 = 28 padding. Correct.
-// New: +8 (requested) +8 (last_act) = +16 bytes.
-// New size unpadded = 8564. 
-// 8564 % 64 = 52. 64 - 52 = 12 padding.
 
 
 typedef struct TIGER_ALIGN(64) peer_entry {
@@ -151,7 +154,11 @@ typedef struct TIGER_ALIGN(64) peer_entry {
 typedef enum {
     IO_NONE = 0,
     IO_READ_CHUNK = 1,
-    IO_WRITE_CHUNK = 2
+    IO_WRITE_CHUNK = 2,
+    // TCP Operations
+    IO_TCP_CONNECT = 3,
+    IO_TCP_SEND = 4, // Encrypt & Send
+    IO_TCP_CLOSE = 5
 } io_req_type_e;
 
 // --- Global Context ---
@@ -227,6 +234,10 @@ typedef enum {
   EVENT_TICK_100MS,
   EVENT_NET_PACKET_RECEIVED,
   EVENT_USER_COMMAND,
+  // TCP Events
+  EVENT_TCP_CONNECTED,
+  EVENT_TCP_DATA,
+  EVENT_TCP_CLOSED
 } event_type_e;
 
 typedef struct {
@@ -238,6 +249,13 @@ typedef struct {
       u32 from_ip;
       u16 from_port;
     } packet;
+    // TCP Data
+    struct {
+        u64 socket;
+        u8* data;
+        u32 len;
+        bool success; // For Connect result
+    } tcp;
     // User Command Data
     struct {
         u32 target_ip;

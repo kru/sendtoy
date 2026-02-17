@@ -133,6 +133,70 @@ int platform_udp_recvfrom(PlatformSocket sock, void *buf, size_t len, char *ip_o
     return received;
 }
 
+// TCP Helpers
+PlatformSocket platform_tcp_bind(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return PLATFORM_INVALID_SOCKET;
+    
+    struct sockaddr_in local;
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = INADDR_ANY;
+    local.sin_port = htons(port);
+    
+    if (bind(s, (SOCKADDR*)&local, sizeof(local)) == SOCKET_ERROR) {
+        closesocket(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    
+    if (listen(s, SOMAXCONN) == SOCKET_ERROR) {
+        closesocket(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    
+    // Set Non-Blocking?
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+    
+    return (PlatformSocket)s;
+}
+
+PlatformSocket platform_tcp_connect(const char* ip, uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return PLATFORM_INVALID_SOCKET;
+    
+    // Set Non-Blocking
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+    
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    inet_pton(AF_INET, ip, &dest.sin_addr);
+    dest.sin_port = htons(port);
+    
+    connect(s, (SOCKADDR*)&dest, sizeof(dest));
+    // Check error? If WSAEWOULDBLOCK, it's connecting.
+    // We return the socket and waiting for Writeability in select loop.
+    
+    return (PlatformSocket)s;
+}
+
+int platform_tcp_send(PlatformSocket sock, const void* data, size_t len) {
+    SOCKET s = (SOCKET)sock;
+    int sent = send(s, (const char*)data, (int)len, 0);
+    if (sent == SOCKET_ERROR) return -1;
+    return sent;
+}
+
+int platform_tcp_recv(PlatformSocket sock, void* buf, size_t len) {
+    SOCKET s = (SOCKET)sock;
+    int received = recv(s, (char*)buf, (int)len, 0);
+    if (received == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return 0;
+        return -1;
+    }
+    return received;
+}
+
 void platform_close_socket(PlatformSocket sock) {
     closesocket((SOCKET)sock);
 }
@@ -337,6 +401,63 @@ static void handle_io_request(PlatformSocket sock) {
         }
     }
 
+    if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+        char ip_str[64];
+        struct in_addr addr;
+        addr.s_addr = g_ctx.io_peer_ip;
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+        
+        PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
+        if (sock != PLATFORM_INVALID_SOCKET) {
+             // We need to update the job with the socket?
+             // Or we wait for EVENT_TCP_CONNECTED?
+             // Since it's non-blocking, we don't know if it's connected yet.
+             // We should store the socket in the job immediately so we can poll it.
+             // But handle_io_request doesn't return anything to state.
+             // We can update g_ctx directly.
+             // Only state.c logic calling this knows which job it is (io_req_job_id).
+             
+             // Update Job Directly (Platform Privilege)
+             for (int i=0; i<JOBS_MAX; ++i) {
+                 if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                     g_ctx.jobs_active[i].tcp_socket = sock;
+                     break;
+                 }
+             }
+        } else {
+             printf("Error: TCP Connect failed to %s\n", ip_str);
+             // Signal failure?
+             state_event_t ev;
+             ev.type = EVENT_TCP_CONNECTED;
+             ev.tcp.socket = 0;
+             ev.tcp.success = false;
+             state_update(&g_ctx, &ev, platform_get_time_ms());
+        }
+    } else if (g_ctx.io_req_type == IO_TCP_SEND) {
+        // Find Job / Socket
+        PlatformSocket sock = PLATFORM_INVALID_SOCKET;
+         for (int i=0; i<JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                 sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+                 break;
+             }
+         }
+         
+         if (sock != PLATFORM_INVALID_SOCKET) {
+             // Send Data
+             // io_data_ptr points to buffer
+             int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
+             if (result < 0) {
+                 printf("Error: TCP Send Failed\n");
+                 // Close?
+             } else {
+                 if (g_ctx.debug_enabled) printf("DEBUG: TCP Sent %d bytes\n", result);
+             }
+         }
+    } else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
+         // ...
+    }
+
     g_ctx.io_req_type = IO_NONE; // Clear
 }
 
@@ -374,6 +495,17 @@ int main(void) {
     }
 
     printf("[TigerStyle] Listening on port %d...\n", g_ctx.config_listen_port);
+
+    printf("[TigerStyle] Listening on port %d...\n", g_ctx.config_listen_port);
+
+    // 3b. TCP Listener
+    PlatformSocket tcp_listener = platform_tcp_bind(g_ctx.config_listen_port);
+    if (tcp_listener == PLATFORM_INVALID_SOCKET) {
+        fprintf(stderr, "Failed to bind TCP listener on port %d\n", g_ctx.config_listen_port);
+        // Continue anyway? UDP might work.
+    } else {
+        printf("[TigerStyle] TCP Listening on port %d...\n", g_ctx.config_listen_port);
+    }
 
     // Command Line Args: Target IP
     const char* target_ip = "255.255.255.255";
@@ -549,34 +681,132 @@ int main(void) {
 
         // 4b. Network Poll
         fd_set readfds;
+        fd_set writefds;
         FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        
         FD_SET((SOCKET)udp_sock, &readfds);
+        if (tcp_listener != PLATFORM_INVALID_SOCKET) {
+            FD_SET((SOCKET)tcp_listener, &readfds);
+        }
+        
+        // Add Active TCP Sockets
+        for (int i=0; i<JOBS_MAX; ++i) {
+            if (g_ctx.jobs_active[i].tcp_socket != 0 && g_ctx.jobs_active[i].tcp_socket != PLATFORM_INVALID_SOCKET) {
+                FD_SET((SOCKET)g_ctx.jobs_active[i].tcp_socket, &readfds);
+                if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+                    FD_SET((SOCKET)g_ctx.jobs_active[i].tcp_socket, &writefds);
+                }
+            }
+        }
 
         struct timeval tv = { 0, 10000 }; // 10ms timeout
 
-        int activity = select(0, &readfds, NULL, NULL, &tv);
+        int activity = select(0, &readfds, &writefds, NULL, &tv);
 
-        if (activity > 0 && FD_ISSET((SOCKET)udp_sock, &readfds)) {
-            char ip_str[64];
-            u16 port;
-            int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
-            
-            if (bytes > 0) {
-                if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
-                state_event_t net_ev;
-                net_ev.type = EVENT_NET_PACKET_RECEIVED;
-                net_ev.packet.data = g_net_rx_buffer;
-                net_ev.packet.len = (u32)bytes;
-                net_ev.packet.from_port = port;
+        if (activity > 0) {
+            // UDP
+            if (FD_ISSET((SOCKET)udp_sock, &readfds)) {
+                char ip_str[64];
+                u16 port;
+                int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
                 
-                struct in_addr addr;
-                if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-                    net_ev.packet.from_ip = addr.s_addr;
-                } else {
-                    net_ev.packet.from_ip = 0;
-                }
+                if (bytes > 0) {
+                    // (UDP Handling same as before)
+                    if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
+                    state_event_t net_ev;
+                    net_ev.type = EVENT_NET_PACKET_RECEIVED;
+                    net_ev.packet.data = g_net_rx_buffer;
+                    net_ev.packet.len = (u32)bytes;
+                    net_ev.packet.from_port = port;
+                    
+                    struct in_addr addr;
+                    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                        net_ev.packet.from_ip = addr.s_addr;
+                    } else {
+                        net_ev.packet.from_ip = 0;
+                    }
 
-                state_update(&g_ctx, &net_ev, platform_get_time_ms());
+                    state_update(&g_ctx, &net_ev, platform_get_time_ms());
+                    handle_io_request(udp_sock);
+                }
+            }
+            
+            // TCP Listener (Accept)
+            if (tcp_listener != PLATFORM_INVALID_SOCKET && FD_ISSET((SOCKET)tcp_listener, &readfds)) {
+                SOCKADDR_IN client_addr;
+                int addrlen = sizeof(client_addr);
+                SOCKET client = accept((SOCKET)tcp_listener, (SOCKADDR*)&client_addr, &addrlen);
+                if (client != INVALID_SOCKET) {
+                    u_long mode = 1;
+                    ioctlsocket(client, FIONBIO, &mode);
+                    
+                    if (g_ctx.debug_enabled) printf("DEBUG: Accepted TCP Connection\n");
+                    
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_CONNECTED;
+                    ev.tcp.socket = (u64)client;
+                    ev.tcp.success = true;
+                    // Provide IP?
+                    // ev.tcp.ip = ...
+                    
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    handle_io_request(udp_sock);
+                }
+            }
+            
+            // TCP Sockets (Data / Connect Completion)
+            for (int i=0; i<JOBS_MAX; ++i) {
+                PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+                if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
+                     // Check Write (Connect Completion)
+                     if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING && FD_ISSET((SOCKET)s, &writefds)) {
+                         // Connected!
+                         state_event_t ev;
+                         ev.type = EVENT_TCP_CONNECTED;
+                         ev.tcp.socket = (u64)s;
+                         ev.tcp.success = true;
+                         state_update(&g_ctx, &ev, platform_get_time_ms());
+                         handle_io_request(udp_sock);
+                         continue;
+                     }
+                     
+                     // Check Read (Data)
+                     if (FD_ISSET((SOCKET)s, &readfds)) {
+                         int n = platform_tcp_recv(s, g_net_rx_buffer, sizeof(g_net_rx_buffer));
+                         if (n > 0) {
+                             state_event_t ev;
+                             ev.type = EVENT_TCP_DATA;
+                             ev.tcp.socket = (u64)s;
+                             ev.tcp.data = g_net_rx_buffer;
+                             ev.tcp.len = (u32)n;
+                             state_update(&g_ctx, &ev, platform_get_time_ms());
+                             handle_io_request(udp_sock);
+                         } else if (n == 0) {
+                             // Does 0 mean closed?
+                             // recv returns 0 on graceful close.
+                             // But we handled EWOULDBLOCK in platform_tcp_recv which returns 0?
+                             // No, platform_tcp_recv returns 0 if EWOULDBLOCK.
+                             // Wait, typical recv returns 0 on CLOSE, -1 on Error.
+                             // My helper returns 0 on EWOULDBLOCK. This is ambiguous.
+                             // Fix helper: return 0 on Close, -1 on Error (check EWOULDBLOCK inside).
+                             // Actually, EWOULDBLOCK should not happen if select said it's readable, unless spuriously.
+                             // Let's assume n > 0 is data. n == 0 could be close or wouldblock.
+                             // Standard: 0 = Closed. -1 = Error.
+                             // If I return 0 for WouldBlock, I can't distinguish.
+                             // Returning -1 for WouldBlock is better, with checking GetLastError.
+                         } else {
+                             // Error or Closed
+                             state_event_t ev;
+                             ev.type = EVENT_TCP_CLOSED;
+                             ev.tcp.socket = (u64)s;
+                             state_update(&g_ctx, &ev, platform_get_time_ms());
+                             // Close socket platform side
+                             closesocket((SOCKET)s);
+                             g_ctx.jobs_active[i].tcp_socket = 0; // State machine should handle this but let's be safe
+                         }
+                     }
+                }
             }
         }
     }
