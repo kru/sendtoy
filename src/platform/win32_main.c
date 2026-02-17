@@ -188,9 +188,26 @@ PlatformSocket platform_tcp_connect(const char* ip, uint16_t port) {
 
 int platform_tcp_send(PlatformSocket sock, const void* data, size_t len) {
     SOCKET s = (SOCKET)sock;
-    int sent = send(s, (const char*)data, (int)len, 0);
-    if (sent == SOCKET_ERROR) return -1;
-    return sent;
+    const char* ptr = (const char*)data;
+    size_t remaining = len;
+    
+    while (remaining > 0) {
+        int sent = send(s, ptr, (int)remaining, 0);
+        if (sent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                // Buffer full, wait a bit
+                Sleep(1); 
+                continue;
+            }
+            return -1;
+        }
+        if (sent == 0) return -1; // Connection closed?
+        
+        ptr += sent;
+        remaining -= sent;
+    }
+    return (int)len;
 }
 
 int platform_tcp_recv(PlatformSocket sock, void* buf, size_t len) {
