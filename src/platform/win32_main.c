@@ -285,9 +285,11 @@ static void handle_io_request(PlatformSocket sock) {
                         
                         offset += chunk_len;
                         
-                        // Tiny sleep to prevent overflowing socket buffer / network?
-                        // On localhost 1MB blast might drop packets.
-                        // platform_sleep_ms(0); // Yield?
+                        // Pacing: Sleep 1ms every 32 packets (~45KB)
+                        // This prevents overwhelming the UDP buffer/Network
+                        if ((offset / chunk_len) % 32 == 0) {
+                            Sleep(1); 
+                        }
                     }
                     
                     if (g_ctx.debug_enabled) printf("DEBUG: Burst Sent %llu bytes (from offset %llu) to %s\n", read, g_ctx.io_req_offset, ip_str);

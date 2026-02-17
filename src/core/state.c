@@ -19,7 +19,7 @@ static void handle_tick(ctx_main_t* ctx, u64 now) {
              
              // Check if stalled
              if (job->bytes_transferred < job->requested_offset) {
-                 if (now - job->last_activity_time > 10) { // 1 second timeout (assuming 100ms ticks)
+                 if (now - job->last_activity_time > 5) { // 0.5 second timeout (assuming 100ms ticks)
                      if (ctx->debug_enabled) printf("DEBUG: Job %d Stalled. Re-requesting offset %llu\n", i, job->bytes_transferred);
                      
                      msg_request_t req = {0};
@@ -274,6 +274,14 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event, u64 now) 
         }
         
         if (job) {
+             // Reliability: Enforce Ordering
+             // If we receive data out of order (offset != bytes_transferred), drop it.
+             // This forces a re-request of the missing piece and ensures we don't have gaps.
+             if (data_msg->offset != job->bytes_transferred) {
+                 // if (ctx->debug_enabled) printf("DEBUG: Drop OoO Data. Want %llu Got %llu\n", job->bytes_transferred, data_msg->offset);
+                 return;
+             }
+
              job->bytes_transferred += data_len;
              job->last_activity_time = now;
              

@@ -278,7 +278,10 @@ static void handle_io_request(PlatformSocket sock) {
                         
                         offset += chunk_len;
                         
-                        // Optional sleep/yield?
+                        // Pacing: Sleep 1ms every 32 packets
+                        if ((offset / chunk_len) % 32 == 0) {
+                            usleep(1000); 
+                        }
                     }
                     
                     if (g_ctx.debug_enabled) printf("DEBUG: Burst Sent %zu bytes to %s\n", read, ip_str);
