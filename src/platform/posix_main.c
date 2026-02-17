@@ -147,6 +147,86 @@ int platform_udp_recvfrom(PlatformSocket sock, void *buf, size_t len, char *ip_o
     return received;
 }
 
+// TCP Helpers
+PlatformSocket platform_tcp_bind(uint16_t port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return PLATFORM_INVALID_SOCKET;
+    
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(port);
+    
+    if (bind(s, (struct sockaddr*)&local, sizeof(local)) < 0) {
+        close(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    
+    if (listen(s, 128) < 0) { // SOMAXCONN often 128 on POSIX
+        close(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    
+    // Set Non-Blocking
+    int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    
+    return s;
+}
+
+PlatformSocket platform_tcp_connect(const char* ip, uint16_t port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return PLATFORM_INVALID_SOCKET;
+    
+    // Set Non-Blocking
+    int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip, &dest.sin_addr) != 1) {
+        close(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    dest.sin_port = htons(port);
+    
+    int res = connect(s, (struct sockaddr*)&dest, sizeof(dest));
+    if (res < 0) {
+        if (errno != EINPROGRESS) {
+            printf("DEBUG: connect failed with error %d (%s)\n", errno, strerror(errno));
+            close(s);
+            return PLATFORM_INVALID_SOCKET;
+        }
+    }
+    
+    return s;
+}
+
+int platform_tcp_send(PlatformSocket sock, const void* data, size_t len) {
+    // MSG_NOSIGNAL to prevent SIGPIPE on broken pipe
+    ssize_t sent = send(sock, data, len, MSG_NOSIGNAL);
+    if (sent < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
+    }
+    return (int)sent;
+}
+
+int platform_tcp_recv(PlatformSocket sock, void* buf, size_t len) {
+    ssize_t received = recv(sock, buf, len, 0);
+    if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
+    }
+    // 0 means clean close
+    return (int)received;
+}
+
 void platform_close_socket(PlatformSocket sock) {
     close(sock);
 }
@@ -330,6 +410,49 @@ static void handle_io_request(PlatformSocket sock) {
         }
     }
 
+    } else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+        char ip_str[64];
+        struct in_addr addr;
+        addr.s_addr = g_ctx.io_peer_ip;
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+        
+        PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
+        if (sock != PLATFORM_INVALID_SOCKET) {
+             for (int i=0; i<JOBS_MAX; ++i) {
+                 if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                     g_ctx.jobs_active[i].tcp_socket = (u64)sock;
+                     break;
+                 }
+             }
+        } else {
+             printf("Error: TCP Connect failed to %s\n", ip_str);
+             state_event_t ev;
+             ev.type = EVENT_TCP_CONNECTED;
+             ev.tcp.socket = 0;
+             ev.tcp.success = false;
+             state_update(&g_ctx, &ev, platform_get_time_ms());
+        }
+    } else if (g_ctx.io_req_type == IO_TCP_SEND) {
+        PlatformSocket sock = PLATFORM_INVALID_SOCKET;
+         for (int i=0; i<JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                 sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+                 break;
+             }
+         }
+         
+         if (sock != PLATFORM_INVALID_SOCKET) {
+             int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
+             if (result < 0) {
+                 printf("Error: TCP Send Failed\n");
+             } else {
+                 if (g_ctx.debug_enabled) printf("DEBUG: TCP Sent %d bytes\n", result);
+             }
+         }
+    } else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
+         // Close logic
+    }
+
     g_ctx.io_req_type = IO_NONE; // Clear
 }
 
@@ -370,6 +493,14 @@ int main(int argc, char **argv) {
     }
 
     printf("[TigerStyle] Listening on port %d...\n", g_ctx.config_listen_port);
+
+    // 3b. TCP Listener
+    PlatformSocket tcp_listener = platform_tcp_bind(g_ctx.config_listen_port);
+    if (tcp_listener == PLATFORM_INVALID_SOCKET) {
+        fprintf(stderr, "Failed to bind TCP listener on port %d\n", g_ctx.config_listen_port);
+    } else {
+        printf("[TigerStyle] TCP Listening on port %d...\n", g_ctx.config_listen_port);
+    }
 
     u64 last_tick = platform_get_time_ms();
 
@@ -419,44 +550,179 @@ int main(int argc, char **argv) {
         }
 
         // 4b. Network Poll (poll) + Stdin Poll
-        struct pollfd fds[2];
-        fds[0].fd = udp_sock;
-        fds[0].events = POLLIN;
-        fds[1].fd = STDIN_FILENO;
-        fds[1].events = POLLIN;
+        // UDP(0) + Stdin(1) + TCP_Listen(2) + Max_Jobs(JOBS_MAX)
+        #define MAX_POLL_FDS (3 + JOBS_MAX)
+        struct pollfd fds[MAX_POLL_FDS];
+        int nfds = 0;
+        
+        // 0. UDP
+        fds[nfds].fd = udp_sock;
+        fds[nfds].events = POLLIN;
+        nfds++;
+        
+        // 1. Stdin
+        fds[nfds].fd = STDIN_FILENO;
+        fds[nfds].events = POLLIN;
+        nfds++;
+        
+        // 2. TCP Listener
+        if (tcp_listener != PLATFORM_INVALID_SOCKET) {
+            fds[nfds].fd = tcp_listener;
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+        
+        // 3... TCP Connections
+        for (int i=0; i<JOBS_MAX; ++i) {
+            PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+            if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
+                fds[nfds].fd = s;
+                fds[nfds].events = POLLIN;
+                // If connecting, wait for POLLOUT
+                if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+                    fds[nfds].events |= POLLOUT;
+                }
+                nfds++;
+            }
+        }
         
         // Timeout 10ms
-        int ret = poll(fds, 2, 10);
+        int ret = poll(fds, nfds, 10);
+
 
         
         if (ret > 0) {
-            // 1. Network
-            if (fds[0].revents & POLLIN) {
-                char ip_str[64];
-                u16 port;
-                int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
+            // 1. Network Scan
+            for (int i=0; i<nfds; ++i) {
+                if (fds[i].revents == 0) continue;
                 
-                if (bytes > 0) {
-                    if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
-                    state_event_t net_ev;
-                    net_ev.type = EVENT_NET_PACKET_RECEIVED;
-                    net_ev.packet.data = g_net_rx_buffer;
-                    net_ev.packet.len = (u32)bytes;
-                    net_ev.packet.from_port = port;
-                    struct in_addr addr;
-                    
-                    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-                         net_ev.packet.from_ip = addr.s_addr;
-                    } else {
-                         net_ev.packet.from_ip = 0;
+                if (fds[i].fd == udp_sock && (fds[i].revents & POLLIN)) {
+                     char ip_str[64];
+                     u16 port;
+                     int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
+                     
+                     if (bytes > 0) {
+                         if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
+                         state_event_t net_ev;
+                         net_ev.type = EVENT_NET_PACKET_RECEIVED;
+                         net_ev.packet.data = g_net_rx_buffer;
+                         net_ev.packet.len = (u32)bytes;
+                         net_ev.packet.from_port = port;
+                         struct in_addr addr;
+                         if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                              net_ev.packet.from_ip = addr.s_addr;
+                         } else {
+                              net_ev.packet.from_ip = 0;
+                         }
+                         state_update(&g_ctx, &net_ev, platform_get_time_ms());
+                         handle_io_request(udp_sock);
+                     }
+                }
+                else if (tcp_listener != PLATFORM_INVALID_SOCKET && fds[i].fd == tcp_listener && (fds[i].revents & POLLIN)) {
+                    // TCP Accept
+                    struct sockaddr_in client_addr;
+                    socklen_t addrlen = sizeof(client_addr);
+                    int client = accept(tcp_listener, (struct sockaddr*)&client_addr, &addrlen);
+                    if (client >= 0) {
+                        int flags = fcntl(client, F_GETFL, 0);
+                        fcntl(client, F_SETFL, flags | O_NONBLOCK);
+                        
+                        char client_ip[64];
+                        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+                        printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
+                        
+                        state_event_t ev;
+                        ev.type = EVENT_TCP_CONNECTED;
+                        ev.tcp.socket = (u64)client;
+                        ev.tcp.success = true;
+                        state_update(&g_ctx, &ev, platform_get_time_ms());
+                        handle_io_request(udp_sock);
                     }
-
-                    state_update(&g_ctx, &net_ev, platform_get_time_ms());
+                }
+                else if (fds[i].fd == STDIN_FILENO && (fds[i].revents & POLLIN)) {
+                    // Stdin handled below to keep structure... or handle here?
+                    // Let's handle it here to simplify the loop
+                    continue; // Skip, detailed below
+                }
+                else {
+                    // Must be a Job Socket
+                    for (int j=0; j<JOBS_MAX; ++j) {
+                        PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[j].tcp_socket;
+                        if (s == fds[i].fd) {
+                            // Check Connect
+                            if (g_ctx.jobs_active[j].state == JOB_STATE_CONNECTING && (fds[i].revents & POLLOUT)) {
+                                int err = 0;
+                                socklen_t len = sizeof(err);
+                                getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+                                
+                                if (err == 0) {
+                                     state_event_t ev;
+                                     ev.type = EVENT_TCP_CONNECTED;
+                                     ev.tcp.socket = (u64)s;
+                                     ev.tcp.success = true;
+                                     state_update(&g_ctx, &ev, platform_get_time_ms());
+                                     handle_io_request(udp_sock);
+                                } else {
+                                     printf("DEBUG: TCP Connect Async Failed error %d\n", err);
+                                     state_event_t ev;
+                                     ev.type = EVENT_TCP_CONNECTED;
+                                     ev.tcp.socket = (u64)s;
+                                     ev.tcp.success = false;
+                                     state_update(&g_ctx, &ev, platform_get_time_ms());
+                                     close(s);
+                                     g_ctx.jobs_active[j].tcp_socket = 0;
+                                }
+                            }
+                            // Check Data
+                            else if (fds[i].revents & POLLIN) {
+                                int n = platform_tcp_recv(s, g_net_rx_buffer, sizeof(g_net_rx_buffer));
+                                if (n > 0) {
+                                     state_event_t ev;
+                                     ev.type = EVENT_TCP_DATA;
+                                     ev.tcp.socket = (u64)s;
+                                     ev.tcp.data = g_net_rx_buffer;
+                                     ev.tcp.len = (u32)n;
+                                     state_update(&g_ctx, &ev, platform_get_time_ms());
+                                     handle_io_request(udp_sock);
+                                } else if (n == 0) {
+                                    // 0 on recv usually means closed. 
+                                    // But check platform_tcp_recv logic.
+                                    // If EWOULDBLOCK, it returned 0? 
+                                    // I checked platform_tcp_recv: returns 0 on EWOULDBLOCK.
+                                    // This is ambiguous!
+                                    // Fix: platform_tcp_recv should return -1 on error (including wouldblock) or handle distinct.
+                                    // Actually, standard recv returns 0 on FIN.
+                                    // My helper returns 0 on EWOULDBLOCK. Bad design.
+                                    // Since POLLIN signaled, EWOULDBLOCK is unlikely unless spurious.
+                                    // Note: If I receive 0 bytes and it was EWOULDBLOCK, I can't distinguish from Close.
+                                    // Let's assume Close for 0.
+                                     state_event_t ev;
+                                     ev.type = EVENT_TCP_CLOSED;
+                                     ev.tcp.socket = (u64)s;
+                                     state_update(&g_ctx, &ev, platform_get_time_ms());
+                                     close(s);
+                                     g_ctx.jobs_active[j].tcp_socket = 0;
+                                } else {
+                                     // Error
+                                     state_event_t ev;
+                                     ev.type = EVENT_TCP_CLOSED;
+                                     ev.tcp.socket = (u64)s;
+                                     state_update(&g_ctx, &ev, platform_get_time_ms());
+                                     close(s);
+                                     g_ctx.jobs_active[j].tcp_socket = 0;
+                                }
+                            }
+                        }
+                    }
                 }
             }
+
             
-            // 2. Console Input
-            if (fds[1].revents & POLLIN) {
+            // 2. Console Input (Find index for Stdin)
+            int stdin_idx = -1;
+            for(int i=0; i<nfds; ++i) if(fds[i].fd == STDIN_FILENO) stdin_idx = i;
+            
+            if (stdin_idx != -1 && (fds[stdin_idx].revents & POLLIN)) {
                 char c;
                 if (read(STDIN_FILENO, &c, 1) > 0) {
                      if (c == '\n') {

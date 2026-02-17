@@ -173,9 +173,15 @@ PlatformSocket platform_tcp_connect(const char* ip, uint16_t port) {
     inet_pton(AF_INET, ip, &dest.sin_addr);
     dest.sin_port = htons(port);
     
-    connect(s, (SOCKADDR*)&dest, sizeof(dest));
-    // Check error? If WSAEWOULDBLOCK, it's connecting.
-    // We return the socket and waiting for Writeability in select loop.
+    int res = connect(s, (SOCKADDR*)&dest, sizeof(dest));
+    if (res == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            printf("DEBUG: connect failed with error %d\n", err);
+            closesocket(s);
+            return PLATFORM_INVALID_SOCKET;
+        }
+    }
     
     return (PlatformSocket)s;
 }
@@ -704,6 +710,10 @@ int main(void) {
 
         int activity = select(0, &readfds, &writefds, NULL, &tv);
 
+        if (activity == SOCKET_ERROR) {
+            printf("DEBUG: select failed with error %d\n", WSAGetLastError());
+        }
+
         if (activity > 0) {
             // UDP
             if (FD_ISSET((SOCKET)udp_sock, &readfds)) {
@@ -712,7 +722,6 @@ int main(void) {
                 int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
                 
                 if (bytes > 0) {
-                    // (UDP Handling same as before)
                     if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
                     state_event_t net_ev;
                     net_ev.type = EVENT_NET_PACKET_RECEIVED;
@@ -741,17 +750,19 @@ int main(void) {
                     u_long mode = 1;
                     ioctlsocket(client, FIONBIO, &mode);
                     
-                    if (g_ctx.debug_enabled) printf("DEBUG: Accepted TCP Connection\n");
+                    char client_ip[64];
+                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+                    printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
                     
                     state_event_t ev;
                     ev.type = EVENT_TCP_CONNECTED;
                     ev.tcp.socket = (u64)client;
                     ev.tcp.success = true;
-                    // Provide IP?
-                    // ev.tcp.ip = ...
                     
                     state_update(&g_ctx, &ev, platform_get_time_ms());
                     handle_io_request(udp_sock);
+                } else {
+                    printf("DEBUG: accept failed with error %d\n", WSAGetLastError());
                 }
             }
             
@@ -761,15 +772,32 @@ int main(void) {
                 if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
                      // Check Write (Connect Completion)
                      if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING && FD_ISSET((SOCKET)s, &writefds)) {
-                         // Connected!
-                         state_event_t ev;
-                         ev.type = EVENT_TCP_CONNECTED;
-                         ev.tcp.socket = (u64)s;
-                         ev.tcp.success = true;
-                         state_update(&g_ctx, &ev, platform_get_time_ms());
-                         handle_io_request(udp_sock);
-                         continue;
+                         // Check for success or error
+                         int err = 0;
+                         int len = sizeof(err);
+                         getsockopt((SOCKET)s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+                         
+                         if (err == 0) {
+                             if (g_ctx.debug_enabled) printf("DEBUG: TCP Socket %llu Connected!\n", s);
+                             state_event_t ev;
+                             ev.type = EVENT_TCP_CONNECTED;
+                             ev.tcp.socket = (u64)s;
+                             ev.tcp.success = true;
+                             state_update(&g_ctx, &ev, platform_get_time_ms());
+                             handle_io_request(udp_sock);
+                         } else {
+                             printf("DEBUG: TCP Connect Async Failed with error %d\n", err);
+                             state_event_t ev;
+                             ev.type = EVENT_TCP_CONNECTED;
+                             ev.tcp.socket = (u64)s;
+                             ev.tcp.success = false;
+                             state_update(&g_ctx, &ev, platform_get_time_ms());
+                             closesocket((SOCKET)s);
+                             g_ctx.jobs_active[i].tcp_socket = 0;
+                         }
+                         continue; // Don't process read this tick if we just connected
                      }
+
                      
                      // Check Read (Data)
                      if (FD_ISSET((SOCKET)s, &readfds)) {
@@ -808,6 +836,16 @@ int main(void) {
                      }
                 }
             }
+        }
+        // Periodic Status Logic
+        if ((now / 2000) != (last_tick / 2000)) {
+            // Every 2 seconds
+             for (int i=0; i<JOBS_MAX; ++i) {
+                if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+                    printf("DEBUG: Job %d still waiting for connection... (Sock %llu)\n", 
+                           g_ctx.jobs_active[i].id, g_ctx.jobs_active[i].tcp_socket);
+                }
+             }
         }
     }
 
