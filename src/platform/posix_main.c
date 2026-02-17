@@ -322,7 +322,7 @@ static void handle_io_request(PlatformSocket sock) {
     if (fname) {
       FILE *f = fopen(fname, "rb");
       if (f) {
-        fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
+        fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
 
         // Read into work_buffer (Up to 1MB)
         // Ensure request fits in work_buffer (4MB)
@@ -420,62 +420,76 @@ static void handle_io_request(PlatformSocket sock) {
         f = fopen(full_path, "wb");
 
       if (f) {
-        fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
+        fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
         fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
         fclose(f);
         if (g_ctx.debug_enabled)
           printf("DEBUG: Wrote Chunks %llu to %s\n", g_ctx.io_req_offset,
                  full_path);
+
+        // Trigger Next Request
+        state_event_t ev;
+        ev.type = EVENT_CHUNK_WRITTEN;
+        ev.tcp.socket = (u64)g_ctx.io_req_job_id;
+        ev.tcp.success = true;
+        state_update(&g_ctx, &ev, platform_get_time_ms());
+
+        // Recursively handle the resulting IO request (REQ Send)
+        handle_io_request(sock);
+
       } else {
         printf("Error: Write IO failed for %s\n", full_path);
       }
     }
+  }
+}
+else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+  char ip_str[64];
+  struct in_addr addr;
+  addr.s_addr = g_ctx.io_peer_ip;
+  inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
 
-  } else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
-    char ip_str[64];
-    struct in_addr addr;
-    addr.s_addr = g_ctx.io_peer_ip;
-    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-
-    PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
-    if (sock != PLATFORM_INVALID_SOCKET) {
-      for (int i = 0; i < JOBS_MAX; ++i) {
-        if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
-          g_ctx.jobs_active[i].tcp_socket = (u64)sock;
-          break;
-        }
-      }
-    } else {
-      printf("Error: TCP Connect failed to %s\n", ip_str);
-      state_event_t ev;
-      ev.type = EVENT_TCP_CONNECTED;
-      ev.tcp.socket = 0;
-      ev.tcp.success = false;
-      state_update(&g_ctx, &ev, platform_get_time_ms());
-    }
-  } else if (g_ctx.io_req_type == IO_TCP_SEND) {
-    PlatformSocket sock = PLATFORM_INVALID_SOCKET;
+  PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
+  if (sock != PLATFORM_INVALID_SOCKET) {
     for (int i = 0; i < JOBS_MAX; ++i) {
       if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
-        sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+        g_ctx.jobs_active[i].tcp_socket = (u64)sock;
         break;
       }
     }
-
-    if (sock != PLATFORM_INVALID_SOCKET) {
-      int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
-      if (result < 0) {
-        printf("Error: TCP Send Failed\n");
-      } else {
-        if (g_ctx.debug_enabled)
-          printf("DEBUG: TCP Sent %d bytes\n", result);
-      }
+  } else {
+    printf("Error: TCP Connect failed to %s\n", ip_str);
+    state_event_t ev;
+    ev.type = EVENT_TCP_CONNECTED;
+    ev.tcp.socket = 0;
+    ev.tcp.success = false;
+    state_update(&g_ctx, &ev, platform_get_time_ms());
+  }
+}
+else if (g_ctx.io_req_type == IO_TCP_SEND) {
+  PlatformSocket sock = PLATFORM_INVALID_SOCKET;
+  for (int i = 0; i < JOBS_MAX; ++i) {
+    if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+      sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+      break;
     }
-  } else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
-    // Close logic
   }
 
-  g_ctx.io_req_type = IO_NONE; // Clear
+  if (sock != PLATFORM_INVALID_SOCKET) {
+    int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
+    if (result < 0) {
+      printf("Error: TCP Send Failed\n");
+    } else {
+      if (g_ctx.debug_enabled)
+        printf("DEBUG: TCP Sent %d bytes\n", result);
+    }
+  }
+}
+else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
+  // Close logic
+}
+
+g_ctx.io_req_type = IO_NONE; // Clear
 }
 
 int main(int argc, char **argv) {
@@ -828,9 +842,9 @@ int main(int argc, char **argv) {
                       // Get File Size/Hash
                       FILE *f = fopen(fname, "rb");
                       if (f) {
-                        fseek(f, 0, SEEK_END);
+                        fseeko(f, 0, SEEK_END);
                         ev.cmd_send.file_size =
-                            (u64)ftell(f); // ftello for large files?
+                            (u64)ftello(f); // ftello for large files?
                         fclose(f);
                         strncpy(ev.cmd_send.filename, fname, 255);
                         ev.cmd_send.file_hash_low = 0xCAFEBABE;

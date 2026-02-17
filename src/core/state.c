@@ -563,7 +563,42 @@ static void handle_tcp_data(ctx_main_t* ctx, u64 socket, u8* data, u32 len) {
              job->bytes_transferred += raw_len;
              
              if (ctx->debug_enabled) printf("DEBUG: Recv TCP Data %u bytes. Total %llu\n", raw_len, job->bytes_transferred);
+             
+             // Pipeline: Request Next Chunk immediately if not finished
+             // We rely on EVENT_CHUNK_WRITTEN to trigger the next request
+             // so that we don't overwrite the IO_WRITE_CHUNK request.
+             if (ctx->debug_enabled && job->bytes_transferred < job->file_size) {
+                 // Debug print to confirm we are waiting for write
+                 // printf("DEBUG: Waiting for Write Completion to request next chunk...\n");
+             }
+         }
+    }
+}
+
+// Handler for Write Completion
+static void handle_write_complete(ctx_main_t* ctx, u64 job_id) {
+    transfer_job_t* job = NULL;
+    for(int i=0; i<JOBS_MAX; ++i) {
+        if(ctx->jobs_active[i].id == job_id && ctx->jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+            job = &ctx->jobs_active[i];
+            break;
         }
+    }
+    
+    if (job && job->bytes_transferred < job->file_size) {
+         msg_request_t req = { .job_id = job->peer_job_id, .offset = job->bytes_transferred, .len = 0xFFFFFFFF };
+         packet_header_t rpkt = { .magic = MAGIC_TOYS, .type = PACKET_TYPE_CHUNK_REQ, .body_length = sizeof(req) };
+         
+         memcpy(ctx->work_buffer, &rpkt, sizeof(rpkt));
+         memcpy(ctx->work_buffer + sizeof(rpkt), &req, sizeof(req));
+         
+         ctx->io_req_type = IO_TCP_SEND;
+         ctx->io_req_job_id = job->id;
+         ctx->io_req_len = sizeof(rpkt) + sizeof(req);
+         ctx->io_data_ptr = ctx->work_buffer;
+    } else if (job && job->bytes_transferred >= job->file_size) {
+        if (ctx->debug_enabled) printf("DEBUG: Transfer Complete for Job %d\n", job->id);
+        job->state = JOB_STATE_COMPLETED; // Or cleanup
     }
 }
 
@@ -610,6 +645,18 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event, u64 now) {
             
         case EVENT_TCP_CLOSED:
             handle_tcp_closed(ctx, event->tcp.socket);
+            changed = true;
+            break;
+            
+        case EVENT_CHUNK_WRITTEN:
+            handle_write_complete(ctx, (u32)event->tcp.socket); // Repurposing socket as job_id here? No, let's use a new field or just pass job_id.
+            // Wait, event definition doesn't have job_id for generic events.
+            // We can use `event->tcp.socket` to pass the job_id casted, or add a field.
+            // Let's use `tcp.socket` as a u64 container for job_id for now to avoid changing types.h struct layout too much.
+            // Or better, add `job_id` to union?
+            // `event->cmd_send` has it? No.
+            // Let's just use `event->packet.from_port`... no that's ugly.
+            // `event->tcp.socket` is u64. Job ID is u32. It fits.
             changed = true;
             break;
 
