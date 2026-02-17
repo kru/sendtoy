@@ -284,8 +284,8 @@ static u8 g_net_rx_buffer[65536];
 
 // TigerStyle: TCP Stream Reassembly Buffers
 typedef struct {
-    u8 buffer[65536 + 4096]; 
-    u32 len;
+  u8 buffer[65536 + 4096];
+  u32 len;
 } JobRxBuffer;
 
 static JobRxBuffer g_job_rx[JOBS_MAX];
@@ -305,189 +305,27 @@ static void handle_io_request(PlatformSocket sock) {
   if (g_ctx.io_req_type == IO_NONE)
     return;
 
-    if (g_ctx.io_req_type == IO_READ_CHUNK) {
-        // Find filename and Job
-        char* fname = NULL;
-        transfer_job_t* job = NULL;
+  if (g_ctx.io_req_type == IO_READ_CHUNK) {
+    // Find filename and Job
+    char *fname = NULL;
+    transfer_job_t *job = NULL;
 
-        for (int i = 0; i < JOBS_MAX; ++i) {
-             if (g_ctx.jobs_active[i].state != JOB_STATE_FREE && 
-                 g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) { 
-                 fname = g_ctx.jobs_active[i].filename;
-                 job = &g_ctx.jobs_active[i];
-                 break;
-             }
-        }
-        
-        // Fallback for MVP
-        if (!fname) {
-             for (int i = 0; i < JOBS_MAX; ++i) {
-                 if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT || 
-                     g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
-                     fname = g_ctx.jobs_active[i].filename;
-                     job = &g_ctx.jobs_active[i];
-                     if (g_ctx.debug_enabled) printf("DEBUG: IO Read Fallback to Job %d File '%s'\n", i, fname);
-                     break;
-                 }
-             }
-        }
-
-        if (fname) {
-            FILE* f = fopen(fname, "rb");
-            if (f) {
-                fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
-                
-                size_t read_len = g_ctx.io_req_len;
-                if (read_len > sizeof(g_ctx.work_buffer)) read_len = sizeof(g_ctx.work_buffer);
-                
-                size_t read = fread(g_ctx.work_buffer, 1, read_len, f);
-                fclose(f);
-                
-                if (read > 0) {
-                    if (job && job->tcp_socket != 0 && job->tcp_socket != PLATFORM_INVALID_SOCKET) {
-                        // ** TCP Fast Path **
-                        // Segment into 64KB chunks to fit in our RX buffers
-                        const size_t TCP_CHUNK_SIZE = 65536 - sizeof(packet_header_t) - sizeof(msg_data_t) - 128; // Safe margin
-                        size_t offset = 0;
-                        PlatformSocket s = (PlatformSocket)job->tcp_socket;
-
-                        while (offset < read) {
-                            size_t chunk_len = read - offset;
-                            if (chunk_len > TCP_CHUNK_SIZE) chunk_len = TCP_CHUNK_SIZE;
-                            
-                            packet_header_t header = {0};
-                            header.magic = MAGIC_TOYS;
-                            header.type = PACKET_TYPE_CHUNK_DATA;
-                            
-                            msg_data_t data_msg = {0};
-                            data_msg.offset = g_ctx.io_req_offset + offset;
-                            data_msg.job_id = job->id; 
-                            
-                            header.body_length = sizeof(msg_data_t) + chunk_len;
-                            
-                            u8* ptr = g_ctx.outbox;
-                            memcpy(ptr, &header, sizeof(packet_header_t));
-                            memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
-                            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
-                                   g_ctx.work_buffer + offset, chunk_len);
-                                   
-                            size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
-                            
-                            int res = platform_tcp_send(s, ptr, packet_len);
-                            if (res < 0) {
-                                printf("Error: TCP Send Failed during chunk xfer. Closing.\n");
-                                break;
-                            }
-                            
-                            offset += chunk_len;
-                            // NO SLEEP!
-                        }
-                        if (g_ctx.debug_enabled) printf("DEBUG: TCP Stream Sent %zu bytes\n", read);
-
-                    } else {
-                        // ** UDP Fallback Path **
-                        const size_t CHUNK_MTU = 1400;
-                        size_t offset = 0;
-                        
-                        char ip_str[64];
-                        struct in_addr addr;
-                        addr.s_addr = g_ctx.io_peer_ip;
-                        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-                        
-                        while (offset < read) {
-                            size_t chunk_len = read - offset;
-                            if (chunk_len > CHUNK_MTU) chunk_len = CHUNK_MTU;
-                            
-                            packet_header_t header = {0};
-                            header.magic = MAGIC_TOYS;
-                            header.type = PACKET_TYPE_CHUNK_DATA;
-                            
-                            msg_data_t data_msg = {0};
-                            data_msg.offset = g_ctx.io_req_offset + offset;
-                            data_msg.job_id = 0; 
-                            
-                            header.body_length = sizeof(msg_data_t) + chunk_len;
-                            
-                            u8* ptr = g_ctx.outbox;
-                            memcpy(ptr, &header, sizeof(packet_header_t));
-                            memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
-                            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
-                                   g_ctx.work_buffer + offset, chunk_len);
-                                   
-                            size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
-                            
-                            platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str, g_ctx.io_peer_port);
-                            
-                            offset += chunk_len;
-                            
-                            // Pacing: Sleep 1ms every 32 packets
-                            if ((offset / chunk_len) % 32 == 0) {
-                                usleep(1000); 
-                            }
-                        }
-                        if (g_ctx.debug_enabled) printf("DEBUG: UDP Burst Sent %zu bytes to %s\n", read, ip_str);
-                    }
-                }
-            } else {
-                printf("Error: Read IO failed for '%s'\n", fname);
-            }
-        } else {
-             if (g_ctx.debug_enabled) printf("DEBUG: IO Read - No Active Job Found for ID %d\n", g_ctx.io_req_job_id);
-        }
-    } 
-    else if (g_ctx.io_req_type == IO_WRITE_CHUNK) {
-        char* fname = NULL;
-        for (int i = 0; i < JOBS_MAX; ++i) {
-             if (g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
-                 fname = g_ctx.jobs_active[i].filename;
-                 break;
-             }
-        }
-        
-        if (fname) {
-            // Construct full path to Downloads
-            char full_path[512];
-            char down_path[256];
-            get_downloads_path(down_path, sizeof(down_path));
-            
-            // Ensure dir exists
-            struct stat st = {0};
-            if (stat(down_path, &st) == -1) {
-                mkdir(down_path, 0755);
-            }
-            
-            snprintf(full_path, sizeof(full_path), "%s/%s", down_path, fname);
-            
-            FILE* f = fopen(full_path, "r+b");
-            if (!f) f = fopen(full_path, "wb"); 
-            
-            if (f) {
-                fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
-                fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
-                fclose(f);
-                if (g_ctx.debug_enabled) printf("DEBUG: Wrote Chunks %llu to %s\n", g_ctx.io_req_offset, full_path);
-
-                // Trigger Next Request
-                state_event_t ev;
-                ev.type = EVENT_CHUNK_WRITTEN;
-                ev.tcp.socket = (u64)g_ctx.io_req_job_id; 
-                ev.tcp.success = true;
-                state_update(&g_ctx, &ev, platform_get_time_ms());
-                
-                // Recursively handle the resulting IO request (REQ Send)
-                handle_io_request(sock);
-
-            } else {
-                printf("Error: Write IO failed for %s\n", full_path);
-            }
-        }
+    for (int i = 0; i < JOBS_MAX; ++i) {
+      if (g_ctx.jobs_active[i].state != JOB_STATE_FREE &&
+          g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+        fname = g_ctx.jobs_active[i].filename;
+        job = &g_ctx.jobs_active[i];
+        break;
+      }
     }
 
+    // Fallback for MVP
     if (!fname) {
       for (int i = 0; i < JOBS_MAX; ++i) {
         if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT ||
             g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
           fname = g_ctx.jobs_active[i].filename;
+          job = &g_ctx.jobs_active[i];
           if (g_ctx.debug_enabled)
             printf("DEBUG: IO Read Fallback to Job %d File '%s'\n", i, fname);
           break;
@@ -500,8 +338,6 @@ static void handle_io_request(PlatformSocket sock) {
       if (f) {
         fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
 
-        // Read into work_buffer (Up to 1MB)
-        // Ensure request fits in work_buffer (4MB)
         size_t read_len = g_ctx.io_req_len;
         if (read_len > sizeof(g_ctx.work_buffer))
           read_len = sizeof(g_ctx.work_buffer);
@@ -510,55 +346,101 @@ static void handle_io_request(PlatformSocket sock) {
         fclose(f);
 
         if (read > 0) {
-          // Burst Send Loop
-          // Split into MTU sized chunks (e.g. 1400 bytes payload)
-          const size_t CHUNK_MTU = 1400;
-          size_t offset = 0;
+          if (job && job->tcp_socket != 0 &&
+              job->tcp_socket != PLATFORM_INVALID_SOCKET) {
+            // ** TCP Fast Path **
+            // Segment into 64KB chunks to fit in our RX buffers
+            const size_t TCP_CHUNK_SIZE = 65536 - sizeof(packet_header_t) -
+                                          sizeof(msg_data_t) -
+                                          128; // Safe margin
+            size_t offset = 0;
+            PlatformSocket s = (PlatformSocket)job->tcp_socket;
 
-          char ip_str[64];
-          struct in_addr addr;
-          addr.s_addr = g_ctx.io_peer_ip;
-          inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+            while (offset < read) {
+              size_t chunk_len = read - offset;
+              if (chunk_len > TCP_CHUNK_SIZE)
+                chunk_len = TCP_CHUNK_SIZE;
 
-          while (offset < read) {
-            size_t chunk_len = read - offset;
-            if (chunk_len > CHUNK_MTU)
-              chunk_len = CHUNK_MTU;
+              packet_header_t header = {0};
+              header.magic = MAGIC_TOYS;
+              header.type = PACKET_TYPE_CHUNK_DATA;
 
-            packet_header_t header = {0};
-            header.magic = MAGIC_TOYS;
-            header.type = PACKET_TYPE_CHUNK_DATA;
+              msg_data_t data_msg = {0};
+              data_msg.offset = g_ctx.io_req_offset + offset;
+              data_msg.job_id = job->id;
 
-            msg_data_t data_msg = {0};
-            data_msg.offset = g_ctx.io_req_offset + offset;
-            data_msg.job_id = 0; // Sender ID?
+              header.body_length = sizeof(msg_data_t) + chunk_len;
 
-            header.body_length = sizeof(msg_data_t) + chunk_len;
+              u8 *ptr = g_ctx.outbox;
+              memcpy(ptr, &header, sizeof(packet_header_t));
+              memcpy(ptr + sizeof(packet_header_t), &data_msg,
+                     sizeof(msg_data_t));
+              memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t),
+                     g_ctx.work_buffer + offset, chunk_len);
 
-            // Copy to outbox
-            u8 *ptr = g_ctx.outbox;
-            memcpy(ptr, &header, sizeof(packet_header_t));
-            memcpy(ptr + sizeof(packet_header_t), &data_msg,
-                   sizeof(msg_data_t));
-            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t),
-                   g_ctx.work_buffer + offset, chunk_len);
+              size_t packet_len =
+                  sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
 
-            size_t packet_len =
-                sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
+              int res = platform_tcp_send(s, ptr, packet_len);
+              if (res < 0) {
+                printf("Error: TCP Send Failed during chunk xfer. Closing.\n");
+                break;
+              }
 
-            platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str,
-                                g_ctx.io_peer_port);
-
-            offset += chunk_len;
-
-            // Pacing: Sleep 1ms every 32 packets
-            if ((offset / chunk_len) % 32 == 0) {
-              usleep(1000);
+              offset += chunk_len;
+              // NO SLEEP!
             }
-          }
+            if (g_ctx.debug_enabled)
+              printf("DEBUG: TCP Stream Sent %zu bytes\n", read);
 
-          if (g_ctx.debug_enabled)
-            printf("DEBUG: Burst Sent %zu bytes to %s\n", read, ip_str);
+          } else {
+            // ** UDP Fallback Path **
+            const size_t CHUNK_MTU = 1400;
+            size_t offset = 0;
+
+            char ip_str[64];
+            struct in_addr addr;
+            addr.s_addr = g_ctx.io_peer_ip;
+            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+
+            while (offset < read) {
+              size_t chunk_len = read - offset;
+              if (chunk_len > CHUNK_MTU)
+                chunk_len = CHUNK_MTU;
+
+              packet_header_t header = {0};
+              header.magic = MAGIC_TOYS;
+              header.type = PACKET_TYPE_CHUNK_DATA;
+
+              msg_data_t data_msg = {0};
+              data_msg.offset = g_ctx.io_req_offset + offset;
+              data_msg.job_id = 0;
+
+              header.body_length = sizeof(msg_data_t) + chunk_len;
+
+              u8 *ptr = g_ctx.outbox;
+              memcpy(ptr, &header, sizeof(packet_header_t));
+              memcpy(ptr + sizeof(packet_header_t), &data_msg,
+                     sizeof(msg_data_t));
+              memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t),
+                     g_ctx.work_buffer + offset, chunk_len);
+
+              size_t packet_len =
+                  sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
+
+              platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str,
+                                  g_ctx.io_peer_port);
+
+              offset += chunk_len;
+
+              // Pacing: Sleep 1ms every 32 packets
+              if ((offset / chunk_len) % 32 == 0) {
+                usleep(1000);
+              }
+            }
+            if (g_ctx.debug_enabled)
+              printf("DEBUG: UDP Burst Sent %zu bytes to %s\n", read, ip_str);
+          }
         }
       } else {
         printf("Error: Read IO failed for '%s'\n", fname);
@@ -617,7 +499,9 @@ static void handle_io_request(PlatformSocket sock) {
         printf("Error: Write IO failed for %s\n", full_path);
       }
     }
-  } else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+  }
+
+  else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
     char ip_str[64];
     struct in_addr addr;
     addr.s_addr = g_ctx.io_peer_ip;
@@ -752,603 +636,627 @@ int main(int argc, char **argv) {
             target_port = g_ctx.outbox_target_port;
         }
 
-        // 4b. Network Poll (poll) + Stdin Poll
-        // UDP(0) + Stdin(1) + TCP_Listen(2) + Max_Jobs(JOBS_MAX)
-        #define MAX_POLL_FDS (3 + JOBS_MAX)
+// 4b. Network Poll (poll) + Stdin Poll
+// UDP(0) + Stdin(1) + TCP_Listen(2) + Max_Jobs(JOBS_MAX)
+#define MAX_POLL_FDS (3 + JOBS_MAX)
         struct pollfd fds[MAX_POLL_FDS];
         int nfds = 0;
-        
+
         // 0. UDP
         fds[nfds].fd = udp_sock;
         fds[nfds].events = POLLIN;
         nfds++;
-        
+
         // 1. Stdin
         fds[nfds].fd = STDIN_FILENO;
         fds[nfds].events = POLLIN;
         nfds++;
-        
+
         // 2. TCP Listener
         if (tcp_listener != PLATFORM_INVALID_SOCKET) {
-            fds[nfds].fd = tcp_listener;
-            fds[nfds].events = POLLIN;
-            nfds++;
+          fds[nfds].fd = tcp_listener;
+          fds[nfds].events = POLLIN;
+          nfds++;
         }
-        
+
         // 3... TCP Connections
-        for (int i=0; i<JOBS_MAX; ++i) {
-            PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
-            if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
-                fds[nfds].fd = s;
-                fds[nfds].events = POLLIN;
-                // If connecting, wait for POLLOUT
-                if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
-                    fds[nfds].events |= POLLOUT;
-                }
-                nfds++;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+          PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+          if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
+            fds[nfds].fd = s;
+            fds[nfds].events = POLLIN;
+            // If connecting, wait for POLLOUT
+            if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+              fds[nfds].events |= POLLOUT;
             }
+            nfds++;
+          }
         }
-        
+
         // Timeout 10ms
         int ret = poll(fds, nfds, 10);
 
-
-        
         if (ret > 0) {
-            // 1. Network Scan
-            for (int i=0; i<nfds; ++i) {
-                if (fds[i].revents == 0) continue;
-                
-                if (fds[i].fd == udp_sock && (fds[i].revents & POLLIN)) {
-                     char ip_str[64];
-                     u16 port;
-                     int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
-                     
-                     if (bytes > 0) {
-                         if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
-                         state_event_t net_ev;
-                         net_ev.type = EVENT_NET_PACKET_RECEIVED;
-                         net_ev.packet.data = g_net_rx_buffer;
-                         net_ev.packet.len = (u32)bytes;
-                         net_ev.packet.from_port = port;
-                         struct in_addr addr;
-                         if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-                              net_ev.packet.from_ip = addr.s_addr;
-                         } else {
-                              net_ev.packet.from_ip = 0;
-                         }
-                         state_update(&g_ctx, &net_ev, platform_get_time_ms());
-                         handle_io_request(udp_sock);
-                     }
+          // 1. Network Scan
+          for (int i = 0; i < nfds; ++i) {
+            if (fds[i].revents == 0)
+              continue;
+
+            if (fds[i].fd == udp_sock && (fds[i].revents & POLLIN)) {
+              char ip_str[64];
+              u16 port;
+              int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer,
+                                                sizeof(g_net_rx_buffer), ip_str,
+                                                sizeof(ip_str), &port);
+
+              if (bytes > 0) {
+                if (g_ctx.debug_enabled)
+                  printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str,
+                         port);
+                state_event_t net_ev;
+                net_ev.type = EVENT_NET_PACKET_RECEIVED;
+                net_ev.packet.data = g_net_rx_buffer;
+                net_ev.packet.len = (u32)bytes;
+                net_ev.packet.from_port = port;
+                struct in_addr addr;
+                if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                  net_ev.packet.from_ip = addr.s_addr;
+                } else {
+                  net_ev.packet.from_ip = 0;
                 }
-                else if (tcp_listener != PLATFORM_INVALID_SOCKET && fds[i].fd == tcp_listener && (fds[i].revents & POLLIN)) {
-                    // TCP Accept
-                    struct sockaddr_in client_addr;
-                    socklen_t addrlen = sizeof(client_addr);
-                    int client = accept(tcp_listener, (struct sockaddr*)&client_addr, &addrlen);
-                    if (client >= 0) {
-                        int flags = fcntl(client, F_GETFL, 0);
-                        fcntl(client, F_SETFL, flags | O_NONBLOCK);
-                        
-                        char client_ip[64];
-                        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-                        printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
-                        
+                state_update(&g_ctx, &net_ev, platform_get_time_ms());
+                handle_io_request(udp_sock);
+              }
+            } else if (tcp_listener != PLATFORM_INVALID_SOCKET &&
+                       fds[i].fd == tcp_listener && (fds[i].revents & POLLIN)) {
+              // TCP Accept
+              struct sockaddr_in client_addr;
+              socklen_t addrlen = sizeof(client_addr);
+              int client = accept(tcp_listener, (struct sockaddr *)&client_addr,
+                                  &addrlen);
+              if (client >= 0) {
+                int flags = fcntl(client, F_GETFL, 0);
+                fcntl(client, F_SETFL, flags | O_NONBLOCK);
+
+                char client_ip[64];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip,
+                          sizeof(client_ip));
+                printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip,
+                       ntohs(client_addr.sin_port));
+
+                state_event_t ev;
+                ev.type = EVENT_TCP_CONNECTED;
+                ev.tcp.socket = (u64)client;
+                ev.tcp.success = true;
+                state_update(&g_ctx, &ev, platform_get_time_ms());
+                handle_io_request(udp_sock);
+              }
+            } else if (fds[i].fd == STDIN_FILENO && (fds[i].revents & POLLIN)) {
+              // Stdin handled below to keep structure... or handle here?
+              // Let's handle it here to simplify the loop
+              continue; // Skip, detailed below
+            } else {
+              // Must be a Job Socket
+              for (int j = 0; j < JOBS_MAX; ++j) {
+                PlatformSocket s =
+                    (PlatformSocket)g_ctx.jobs_active[j].tcp_socket;
+                if (s == fds[i].fd) {
+                  // Check Connect
+                  if (g_ctx.jobs_active[j].state == JOB_STATE_CONNECTING &&
+                      (fds[i].revents & POLLOUT)) {
+                    int err = 0;
+                    socklen_t len = sizeof(err);
+                    getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+
+                    if (err == 0) {
+                      state_event_t ev;
+                      ev.type = EVENT_TCP_CONNECTED;
+                      ev.tcp.socket = (u64)s;
+                      ev.tcp.success = true;
+                      state_update(&g_ctx, &ev, platform_get_time_ms());
+                      handle_io_request(udp_sock);
+                    } else {
+                      printf("DEBUG: TCP Connect Async Failed error %d\n", err);
+                      state_event_t ev;
+                      ev.type = EVENT_TCP_CONNECTED;
+                      ev.tcp.socket = (u64)s;
+                      ev.tcp.success = false;
+                      state_update(&g_ctx, &ev, platform_get_time_ms());
+                      close(s);
+                      g_ctx.jobs_active[j].tcp_socket = 0;
+                    }
+                  }
+                  // Check Data
+                  else if (fds[i].revents & POLLIN) {
+                    JobRxBuffer *rx = &g_job_rx[j];
+                    int space = sizeof(rx->buffer) - rx->len;
+                    if (space > 0) {
+                      int n = platform_tcp_recv(s, rx->buffer + rx->len, space);
+                      if (n > 0) {
+                        rx->len += n;
+
+                        // Framing Loop
+                        while (rx->len >= sizeof(packet_header_t)) {
+                          packet_header_t *head = (packet_header_t *)rx->buffer;
+                          if (head->magic != MAGIC_TOYS) {
+                            printf("DEBUG: TCP Magic Mismatch! Closing.\n");
+                            state_event_t ev;
+                            ev.type = EVENT_TCP_CLOSED;
+                            ev.tcp.socket = (u64)s;
+                            state_update(&g_ctx, &ev, platform_get_time_ms());
+                            close(s);
+                            g_ctx.jobs_active[j].tcp_socket = 0;
+                            rx->len = 0;
+                            break;
+                          }
+
+                          u32 packet_len =
+                              sizeof(packet_header_t) + (u32)head->body_length;
+                          if (rx->len >= packet_len) {
+                            state_event_t ev;
+                            ev.type = EVENT_TCP_DATA;
+                            ev.tcp.socket = (u64)s;
+                            ev.tcp.data = rx->buffer;
+                            ev.tcp.len = packet_len;
+                            state_update(&g_ctx, &ev, platform_get_time_ms());
+                            handle_io_request(udp_sock);
+
+                            u32 remaining = rx->len - packet_len;
+                            if (remaining > 0) {
+                              memmove(rx->buffer, rx->buffer + packet_len,
+                                      remaining);
+                            }
+                            rx->len = remaining;
+                          } else {
+                            break;
+                          }
+                        }
+                      } else if (n == 0) {
+                        // Close
                         state_event_t ev;
-                        ev.type = EVENT_TCP_CONNECTED;
-                        ev.tcp.socket = (u64)client;
-                        ev.tcp.success = true;
+                        ev.type = EVENT_TCP_CLOSED;
+                        ev.tcp.socket = (u64)s;
                         state_update(&g_ctx, &ev, platform_get_time_ms());
-                        handle_io_request(udp_sock);
+                        close(s);
+                        g_ctx.jobs_active[j].tcp_socket = 0;
+                        rx->len = 0;
+                      } else {
+                        // Error
+                        state_event_t ev;
+                        ev.type = EVENT_TCP_CLOSED;
+                        ev.tcp.socket = (u64)s;
+                        state_update(&g_ctx, &ev, platform_get_time_ms());
+                        close(s);
+                        g_ctx.jobs_active[j].tcp_socket = 0;
+                        rx->len = 0;
+                      }
                     }
+                  }
                 }
-                else if (fds[i].fd == STDIN_FILENO && (fds[i].revents & POLLIN)) {
-                    // Stdin handled below to keep structure... or handle here?
-                    // Let's handle it here to simplify the loop
-                    continue; // Skip, detailed below
-                }
-                else {
-                    // Must be a Job Socket
-                    for (int j=0; j<JOBS_MAX; ++j) {
-                        PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[j].tcp_socket;
-                        if (s == fds[i].fd) {
-                            // Check Connect
-                            if (g_ctx.jobs_active[j].state == JOB_STATE_CONNECTING && (fds[i].revents & POLLOUT)) {
-                                int err = 0;
-                                socklen_t len = sizeof(err);
-                                getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
-                                
-                                if (err == 0) {
-                                     state_event_t ev;
-                                     ev.type = EVENT_TCP_CONNECTED;
-                                     ev.tcp.socket = (u64)s;
-                                     ev.tcp.success = true;
-                                     state_update(&g_ctx, &ev, platform_get_time_ms());
-                                     handle_io_request(udp_sock);
-                                } else {
-                                     printf("DEBUG: TCP Connect Async Failed error %d\n", err);
-                                     state_event_t ev;
-                                     ev.type = EVENT_TCP_CONNECTED;
-                                     ev.tcp.socket = (u64)s;
-                                     ev.tcp.success = false;
-                                     state_update(&g_ctx, &ev, platform_get_time_ms());
-                                     close(s);
-                                     g_ctx.jobs_active[j].tcp_socket = 0;
-                                }
-                            }
-                            // Check Data
-                            else if (fds[i].revents & POLLIN) {
-                                JobRxBuffer* rx = &g_job_rx[j];
-                                int space = sizeof(rx->buffer) - rx->len;
-                                if (space > 0) {
-                                    int n = platform_tcp_recv(s, rx->buffer + rx->len, space);
-                                    if (n > 0) {
-                                        rx->len += n;
-                                        
-                                        // Framing Loop
-                                        while (rx->len >= sizeof(packet_header_t)) {
-                                            packet_header_t* head = (packet_header_t*)rx->buffer;
-                                            if (head->magic != MAGIC_TOYS) {
-                                                printf("DEBUG: TCP Magic Mismatch! Closing.\n");
-                                                state_event_t ev;
-                                                ev.type = EVENT_TCP_CLOSED;
-                                                ev.tcp.socket = (u64)s;
-                                                state_update(&g_ctx, &ev, platform_get_time_ms());
-                                                close(s);
-                                                g_ctx.jobs_active[j].tcp_socket = 0;
-                                                rx->len = 0;
-                                                break;
-                                            }
-                                            
-                                            u32 packet_len = sizeof(packet_header_t) + (u32)head->body_length;
-                                            if (rx->len >= packet_len) {
-                                                state_event_t ev;
-                                                ev.type = EVENT_TCP_DATA;
-                                                ev.tcp.socket = (u64)s;
-                                                ev.tcp.data = rx->buffer;
-                                                ev.tcp.len = packet_len;
-                                                state_update(&g_ctx, &ev, platform_get_time_ms());
-                                                handle_io_request(udp_sock);
-                                                
-                                                u32 remaining = rx->len - packet_len;
-                                                if (remaining > 0) {
-                                                    memmove(rx->buffer, rx->buffer + packet_len, remaining);
-                                                }
-                                                rx->len = remaining;
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                    } else if (n == 0) {
-                                        // Close
-                                        state_event_t ev;
-                                        ev.type = EVENT_TCP_CLOSED;
-                                        ev.tcp.socket = (u64)s;
-                                        state_update(&g_ctx, &ev, platform_get_time_ms());
-                                        close(s);
-                                        g_ctx.jobs_active[j].tcp_socket = 0;
-                                        rx->len = 0;
-                                    } else {
-                                        // Error
-                                        state_event_t ev;
-                                        ev.type = EVENT_TCP_CLOSED;
-                                        ev.tcp.socket = (u64)s;
-                                        state_update(&g_ctx, &ev, platform_get_time_ms());
-                                        close(s);
-                                        g_ctx.jobs_active[j].tcp_socket = 0;
-                                        rx->len = 0;
-                                    }
-                                }
-                            }
+              }
+            }
+          }
+
+          // 2. Console Input (Find index for Stdin)
+          int stdin_idx = -1;
+          for (int i = 0; i < nfds; ++i)
+            if (fds[i].fd == STDIN_FILENO)
+              stdin_idx = i;
+
+          if (stdin_idx != -1 && (fds[stdin_idx].revents & POLLIN)) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) > 0) {
+              if (c == '\n') {
+                if (input_pos > 0) {
+                  input_buf[input_pos] = 0;
+                  printf("CMD: %s\n", input_buf);
+
+                  // Parse "send <IP> <File>" manually to handle quotes/spaces
+                  char cmd[16] = {0};
+                  char ip_str[64] = {0};
+                  char fname[256] = {0};
+
+                  char *s = input_buf;
+
+                  // 1. Skip leading whitespace
+                  while (*s && *s <= 32)
+                    s++;
+
+                  // 2. Parse Command
+                  int i = 0;
+                  while (*s && *s > 32 && i < 15)
+                    cmd[i++] = *s++;
+                  cmd[i] = 0;
+
+                  // 3. Skip whitespace
+                  while (*s && *s <= 32)
+                    s++;
+
+                  // 4. Parse IP
+                  i = 0;
+                  while (*s && *s > 32 && i < 63)
+                    ip_str[i++] = *s++;
+                  ip_str[i] = 0;
+
+                  // 5. Skip whitespace
+                  while (*s && *s <= 32)
+                    s++;
+
+                  // 6. Parse Filename (Handle Quotes)
+                  if (*s == '\"') {
+                    s++; // Skip open quote
+                    i = 0;
+                    while (*s && *s != '\"' && i < 255)
+                      fname[i++] = *s++;
+                    if (*s == '\"')
+                      s++; // Skip close quote
+                  } else {
+                    i = 0;
+                    while (*s && *s >= 32 && i < 255)
+                      fname[i++] = *s++; // Take rest of line
+                    // Trim trailing whitespace?
+                    while (i > 0 && fname[i - 1] <= 32)
+                      i--;
+                  }
+                  fname[i] = 0;
+
+                  if (cmd[0]) {
+                    if (strcmp(cmd, "send") == 0) {
+                      if (ip_str[0] && fname[0]) {
+                        state_event_t ev;
+                        ev.type = EVENT_USER_COMMAND;
+
+                        struct in_addr addr;
+                        if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                          ev.cmd_send.target_ip = addr.s_addr;
+
+                          // Get File Size/Hash
+                          FILE *f = fopen(fname, "rb");
+                          if (f) {
+                            fseeko(f, 0, SEEK_END);
+                            ev.cmd_send.file_size =
+                                (u64)ftello(f); // ftello for large files?
+                            fclose(f);
+                            strncpy(ev.cmd_send.filename, fname, 255);
+                            ev.cmd_send.file_hash_low = 0xCAFEBABE;
+
+                            state_update(&g_ctx, &ev, platform_get_time_ms());
+                          } else {
+                            printf("Error: File not found: %s\n", fname);
+                          }
+                        } else {
+                          printf("Error: Invalid IP\n");
                         }
+                      } else {
+                        printf("Usage: send <IP> <File>\n");
+                      }
+                    } else if (strcmp(cmd, "debug") == 0) {
+                      if (strcmp(ip_str, "on") == 0 ||
+                          strcmp(ip_str, "1") == 0) {
+                        g_ctx.debug_enabled = true;
+                        printf("Debug Mode: ON\n");
+                      } else if (strcmp(ip_str, "off") == 0 ||
+                                 strcmp(ip_str, "0") == 0) {
+                        g_ctx.debug_enabled = false;
+                        printf("Debug Mode: OFF\n");
+                      } else {
+                        printf("Usage: debug <on|off>\n");
+                      }
                     }
+                  }
+                  input_pos = 0;
                 }
+                printf("> ");
+                fflush(stdout);
+              } else if (c >= 32 && c <= 126 &&
+                         input_pos < sizeof(input_buf) - 1) {
+                input_buf[input_pos++] = c;
+                // printf("%c", c); // Local echo? Depends on terminal mode.
+                // Usually local echo is on, so we don't print.
+              }
             }
-
-            
-            // 2. Console Input (Find index for Stdin)
-            int stdin_idx = -1;
-            for(int i=0; i<nfds; ++i) if(fds[i].fd == STDIN_FILENO) stdin_idx = i;
-            
-            if (stdin_idx != -1 && (fds[stdin_idx].revents & POLLIN)) {
-                char c;
-                if (read(STDIN_FILENO, &c, 1) > 0) {
-                     if (c == '\n') {
-                        if (input_pos > 0) {
-                            input_buf[input_pos] = 0;
-                            printf("CMD: %s\n", input_buf);
-                            
-                            // Parse "send <IP> <File>" manually to handle quotes/spaces
-                            char cmd[16] = {0};
-                            char ip_str[64] = {0};
-                            char fname[256] = {0};
-                            
-                            char* s = input_buf;
-                            
-                            // 1. Skip leading whitespace
-                            while (*s && *s <= 32) s++;
-                            
-                            // 2. Parse Command
-                            int i = 0;
-                            while (*s && *s > 32 && i < 15) cmd[i++] = *s++;
-                            cmd[i] = 0;
-                            
-                            // 3. Skip whitespace
-                            while (*s && *s <= 32) s++;
-                            
-                            // 4. Parse IP
-                            i = 0;
-                            while (*s && *s > 32 && i < 63) ip_str[i++] = *s++;
-                            ip_str[i] = 0;
-                            
-                            // 5. Skip whitespace
-                            while (*s && *s <= 32) s++;
-                            
-                            // 6. Parse Filename (Handle Quotes)
-                            if (*s == '\"') {
-                                s++; // Skip open quote
-                                i = 0;
-                                while (*s && *s != '\"' && i < 255) fname[i++] = *s++;
-                                if (*s == '\"') s++; // Skip close quote
-                            } else {
-                                i = 0;
-                                while (*s && *s >= 32 && i < 255) fname[i++] = *s++; // Take rest of line
-                                // Trim trailing whitespace?
-                                while (i > 0 && fname[i-1] <= 32) i--;
-                            }
-                            fname[i] = 0;
-
-                            if (cmd[0]) {
-                                if (strcmp(cmd, "send") == 0) {
-                                    if (ip_str[0] && fname[0]) {
-                                        state_event_t ev;
-                                        ev.type = EVENT_USER_COMMAND;
-                                        
-                                        struct in_addr addr;
-                                        if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-                                            ev.cmd_send.target_ip = addr.s_addr;
-                                            
-                                            // Get File Size/Hash
-                                            FILE* f = fopen(fname, "rb");
-                                            if (f) {
-                                                fseeko(f, 0, SEEK_END);
-                                                ev.cmd_send.file_size = (u64)ftello(f); // ftello for large files?
-                                                fclose(f);
-                                                strncpy(ev.cmd_send.filename, fname, 255);
-                                                ev.cmd_send.file_hash_low = 0xCAFEBABE; 
-                                                
-                                                state_update(&g_ctx, &ev, platform_get_time_ms());
-                                            } else {
-                                                printf("Error: File not found: %s\n", fname);
-                                            }
-                                        } else {
-                                            printf("Error: Invalid IP\n");
-                                        }
-                                    } else {
-                                        printf("Usage: send <IP> <File>\n");
-                                    }
-                                } else if (strcmp(cmd, "debug") == 0) {
-                                    if (strcmp(ip_str, "on") == 0 || strcmp(ip_str, "1") == 0) {
-                                        g_ctx.debug_enabled = true;
-                                        printf("Debug Mode: ON\n");
-                                    } else if (strcmp(ip_str, "off") == 0 || strcmp(ip_str, "0") == 0) {
-                                        g_ctx.debug_enabled = false;
-                                        printf("Debug Mode: OFF\n");
-                                    } else {
-                                        printf("Usage: debug <on|off>\n");
-                                    }
-                                }
-                            }
-                            input_pos = 0;
-                        }
-                        printf("> ");
-                        fflush(stdout);
-                     } else if (c >= 32 && c <= 126 && input_pos < sizeof(input_buf) - 1) {
-                        input_buf[input_pos++] = c;
-                        // printf("%c", c); // Local echo? Depends on terminal mode. 
-                        // Usually local echo is on, so we don't print.
-                     }
-                }
-            }
+          }
         }
-    }
+      }
 
 // 4b. Network Poll (poll) + Stdin Poll
 // UDP(0) + Stdin(1) + TCP_Listen(2) + Max_Jobs(JOBS_MAX)
 #define MAX_POLL_FDS (3 + JOBS_MAX)
-    struct pollfd fds[MAX_POLL_FDS];
-    int nfds = 0;
+      struct pollfd fds[MAX_POLL_FDS];
+      int nfds = 0;
 
-    // 0. UDP
-    fds[nfds].fd = udp_sock;
-    fds[nfds].events = POLLIN;
-    nfds++;
-
-    // 1. Stdin
-    fds[nfds].fd = STDIN_FILENO;
-    fds[nfds].events = POLLIN;
-    nfds++;
-
-    // 2. TCP Listener
-    if (tcp_listener != PLATFORM_INVALID_SOCKET) {
-      fds[nfds].fd = tcp_listener;
+      // 0. UDP
+      fds[nfds].fd = udp_sock;
       fds[nfds].events = POLLIN;
       nfds++;
-    }
 
-    // 3... TCP Connections
-    for (int i = 0; i < JOBS_MAX; ++i) {
-      PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
-      if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
-        fds[nfds].fd = s;
+      // 1. Stdin
+      fds[nfds].fd = STDIN_FILENO;
+      fds[nfds].events = POLLIN;
+      nfds++;
+
+      // 2. TCP Listener
+      if (tcp_listener != PLATFORM_INVALID_SOCKET) {
+        fds[nfds].fd = tcp_listener;
         fds[nfds].events = POLLIN;
-        // If connecting, wait for POLLOUT
-        if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
-          fds[nfds].events |= POLLOUT;
-        }
         nfds++;
       }
-    }
 
-    // Timeout 10ms
-    int ret = poll(fds, nfds, 10);
-
-    if (ret > 0) {
-      // 1. Network Scan
-      for (int i = 0; i < nfds; ++i) {
-        if (fds[i].revents == 0)
-          continue;
-
-        if (fds[i].fd == udp_sock && (fds[i].revents & POLLIN)) {
-          char ip_str[64];
-          u16 port;
-          int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer,
-                                            sizeof(g_net_rx_buffer), ip_str,
-                                            sizeof(ip_str), &port);
-
-          if (bytes > 0) {
-            if (g_ctx.debug_enabled)
-              printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str,
-                     port);
-            state_event_t net_ev;
-            net_ev.type = EVENT_NET_PACKET_RECEIVED;
-            net_ev.packet.data = g_net_rx_buffer;
-            net_ev.packet.len = (u32)bytes;
-            net_ev.packet.from_port = port;
-            struct in_addr addr;
-            if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-              net_ev.packet.from_ip = addr.s_addr;
-            } else {
-              net_ev.packet.from_ip = 0;
-            }
-            state_update(&g_ctx, &net_ev, platform_get_time_ms());
-            handle_io_request(udp_sock);
+      // 3... TCP Connections
+      for (int i = 0; i < JOBS_MAX; ++i) {
+        PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+        if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
+          fds[nfds].fd = s;
+          fds[nfds].events = POLLIN;
+          // If connecting, wait for POLLOUT
+          if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+            fds[nfds].events |= POLLOUT;
           }
-        } else if (tcp_listener != PLATFORM_INVALID_SOCKET &&
-                   fds[i].fd == tcp_listener && (fds[i].revents & POLLIN)) {
-          // TCP Accept
-          struct sockaddr_in client_addr;
-          socklen_t addrlen = sizeof(client_addr);
-          int client =
-              accept(tcp_listener, (struct sockaddr *)&client_addr, &addrlen);
-          if (client >= 0) {
-            int flags = fcntl(client, F_GETFL, 0);
-            fcntl(client, F_SETFL, flags | O_NONBLOCK);
+          nfds++;
+        }
+      }
 
-            char client_ip[64];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip,
-                      sizeof(client_ip));
-            printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip,
-                   ntohs(client_addr.sin_port));
+      // Timeout 10ms
+      int ret = poll(fds, nfds, 10);
 
-            state_event_t ev;
-            ev.type = EVENT_TCP_CONNECTED;
-            ev.tcp.socket = (u64)client;
-            ev.tcp.success = true;
-            state_update(&g_ctx, &ev, platform_get_time_ms());
-            handle_io_request(udp_sock);
-          }
-        } else if (fds[i].fd == STDIN_FILENO && (fds[i].revents & POLLIN)) {
-          // Stdin handled below to keep structure... or handle here?
-          // Let's handle it here to simplify the loop
-          continue; // Skip, detailed below
-        } else {
-          // Must be a Job Socket
-          for (int j = 0; j < JOBS_MAX; ++j) {
-            PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[j].tcp_socket;
-            if (s == fds[i].fd) {
-              // Check Connect
-              if (g_ctx.jobs_active[j].state == JOB_STATE_CONNECTING &&
-                  (fds[i].revents & POLLOUT)) {
-                int err = 0;
-                socklen_t len = sizeof(err);
-                getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+      if (ret > 0) {
+        // 1. Network Scan
+        for (int i = 0; i < nfds; ++i) {
+          if (fds[i].revents == 0)
+            continue;
 
-                if (err == 0) {
-                  state_event_t ev;
-                  ev.type = EVENT_TCP_CONNECTED;
-                  ev.tcp.socket = (u64)s;
-                  ev.tcp.success = true;
-                  state_update(&g_ctx, &ev, platform_get_time_ms());
-                  handle_io_request(udp_sock);
-                } else {
-                  printf("DEBUG: TCP Connect Async Failed error %d\n", err);
-                  state_event_t ev;
-                  ev.type = EVENT_TCP_CONNECTED;
-                  ev.tcp.socket = (u64)s;
-                  ev.tcp.success = false;
-                  state_update(&g_ctx, &ev, platform_get_time_ms());
-                  close(s);
-                  g_ctx.jobs_active[j].tcp_socket = 0;
-                }
+          if (fds[i].fd == udp_sock && (fds[i].revents & POLLIN)) {
+            char ip_str[64];
+            u16 port;
+            int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer,
+                                              sizeof(g_net_rx_buffer), ip_str,
+                                              sizeof(ip_str), &port);
+
+            if (bytes > 0) {
+              if (g_ctx.debug_enabled)
+                printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str,
+                       port);
+              state_event_t net_ev;
+              net_ev.type = EVENT_NET_PACKET_RECEIVED;
+              net_ev.packet.data = g_net_rx_buffer;
+              net_ev.packet.len = (u32)bytes;
+              net_ev.packet.from_port = port;
+              struct in_addr addr;
+              if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                net_ev.packet.from_ip = addr.s_addr;
+              } else {
+                net_ev.packet.from_ip = 0;
               }
-              // Check Data
-              else if (fds[i].revents & POLLIN) {
-                int n = platform_tcp_recv(s, g_net_rx_buffer,
-                                          sizeof(g_net_rx_buffer));
-                if (n > 0) {
-                  state_event_t ev;
-                  ev.type = EVENT_TCP_DATA;
-                  ev.tcp.socket = (u64)s;
-                  ev.tcp.data = g_net_rx_buffer;
-                  ev.tcp.len = (u32)n;
-                  state_update(&g_ctx, &ev, platform_get_time_ms());
-                  handle_io_request(udp_sock);
-                } else if (n == 0) {
-                  // 0 on recv usually means closed.
-                  // But check platform_tcp_recv logic.
-                  // If EWOULDBLOCK, it returned 0?
-                  // I checked platform_tcp_recv: returns 0 on EWOULDBLOCK.
-                  // This is ambiguous!
-                  // Fix: platform_tcp_recv should return -1 on error
-                  // (including wouldblock) or handle distinct. Actually,
-                  // standard recv returns 0 on FIN. My helper returns 0 on
-                  // EWOULDBLOCK. Bad design. Since POLLIN signaled,
-                  // EWOULDBLOCK is unlikely unless spurious. Note: If I
-                  // receive 0 bytes and it was EWOULDBLOCK, I can't
-                  // distinguish from Close. Let's assume Close for 0.
-                  state_event_t ev;
-                  ev.type = EVENT_TCP_CLOSED;
-                  ev.tcp.socket = (u64)s;
-                  state_update(&g_ctx, &ev, platform_get_time_ms());
-                  close(s);
-                  g_ctx.jobs_active[j].tcp_socket = 0;
-                } else {
-                  // Error
-                  state_event_t ev;
-                  ev.type = EVENT_TCP_CLOSED;
-                  ev.tcp.socket = (u64)s;
-                  state_update(&g_ctx, &ev, platform_get_time_ms());
-                  close(s);
-                  g_ctx.jobs_active[j].tcp_socket = 0;
+              state_update(&g_ctx, &net_ev, platform_get_time_ms());
+              handle_io_request(udp_sock);
+            }
+          } else if (tcp_listener != PLATFORM_INVALID_SOCKET &&
+                     fds[i].fd == tcp_listener && (fds[i].revents & POLLIN)) {
+            // TCP Accept
+            struct sockaddr_in client_addr;
+            socklen_t addrlen = sizeof(client_addr);
+            int client =
+                accept(tcp_listener, (struct sockaddr *)&client_addr, &addrlen);
+            if (client >= 0) {
+              int flags = fcntl(client, F_GETFL, 0);
+              fcntl(client, F_SETFL, flags | O_NONBLOCK);
+
+              char client_ip[64];
+              inet_ntop(AF_INET, &client_addr.sin_addr, client_ip,
+                        sizeof(client_ip));
+              printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip,
+                     ntohs(client_addr.sin_port));
+
+              state_event_t ev;
+              ev.type = EVENT_TCP_CONNECTED;
+              ev.tcp.socket = (u64)client;
+              ev.tcp.success = true;
+              state_update(&g_ctx, &ev, platform_get_time_ms());
+              handle_io_request(udp_sock);
+            }
+          } else if (fds[i].fd == STDIN_FILENO && (fds[i].revents & POLLIN)) {
+            // Stdin handled below to keep structure... or handle here?
+            // Let's handle it here to simplify the loop
+            continue; // Skip, detailed below
+          } else {
+            // Must be a Job Socket
+            for (int j = 0; j < JOBS_MAX; ++j) {
+              PlatformSocket s =
+                  (PlatformSocket)g_ctx.jobs_active[j].tcp_socket;
+              if (s == fds[i].fd) {
+                // Check Connect
+                if (g_ctx.jobs_active[j].state == JOB_STATE_CONNECTING &&
+                    (fds[i].revents & POLLOUT)) {
+                  int err = 0;
+                  socklen_t len = sizeof(err);
+                  getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+
+                  if (err == 0) {
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_CONNECTED;
+                    ev.tcp.socket = (u64)s;
+                    ev.tcp.success = true;
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    handle_io_request(udp_sock);
+                  } else {
+                    printf("DEBUG: TCP Connect Async Failed error %d\n", err);
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_CONNECTED;
+                    ev.tcp.socket = (u64)s;
+                    ev.tcp.success = false;
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    close(s);
+                    g_ctx.jobs_active[j].tcp_socket = 0;
+                  }
+                }
+                // Check Data
+                else if (fds[i].revents & POLLIN) {
+                  int n = platform_tcp_recv(s, g_net_rx_buffer,
+                                            sizeof(g_net_rx_buffer));
+                  if (n > 0) {
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_DATA;
+                    ev.tcp.socket = (u64)s;
+                    ev.tcp.data = g_net_rx_buffer;
+                    ev.tcp.len = (u32)n;
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    handle_io_request(udp_sock);
+                  } else if (n == 0) {
+                    // 0 on recv usually means closed.
+                    // But check platform_tcp_recv logic.
+                    // If EWOULDBLOCK, it returned 0?
+                    // I checked platform_tcp_recv: returns 0 on EWOULDBLOCK.
+                    // This is ambiguous!
+                    // Fix: platform_tcp_recv should return -1 on error
+                    // (including wouldblock) or handle distinct. Actually,
+                    // standard recv returns 0 on FIN. My helper returns 0 on
+                    // EWOULDBLOCK. Bad design. Since POLLIN signaled,
+                    // EWOULDBLOCK is unlikely unless spurious. Note: If I
+                    // receive 0 bytes and it was EWOULDBLOCK, I can't
+                    // distinguish from Close. Let's assume Close for 0.
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_CLOSED;
+                    ev.tcp.socket = (u64)s;
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    close(s);
+                    g_ctx.jobs_active[j].tcp_socket = 0;
+                  } else {
+                    // Error
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_CLOSED;
+                    ev.tcp.socket = (u64)s;
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    close(s);
+                    g_ctx.jobs_active[j].tcp_socket = 0;
+                  }
                 }
               }
             }
           }
         }
-      }
 
-      // 2. Console Input (Find index for Stdin)
-      int stdin_idx = -1;
-      for (int i = 0; i < nfds; ++i)
-        if (fds[i].fd == STDIN_FILENO)
-          stdin_idx = i;
+        // 2. Console Input (Find index for Stdin)
+        int stdin_idx = -1;
+        for (int i = 0; i < nfds; ++i)
+          if (fds[i].fd == STDIN_FILENO)
+            stdin_idx = i;
 
-      if (stdin_idx != -1 && (fds[stdin_idx].revents & POLLIN)) {
-        char c;
-        if (read(STDIN_FILENO, &c, 1) > 0) {
-          if (c == '\n') {
-            if (input_pos > 0) {
-              input_buf[input_pos] = 0;
-              printf("CMD: %s\n", input_buf);
+        if (stdin_idx != -1 && (fds[stdin_idx].revents & POLLIN)) {
+          char c;
+          if (read(STDIN_FILENO, &c, 1) > 0) {
+            if (c == '\n') {
+              if (input_pos > 0) {
+                input_buf[input_pos] = 0;
+                printf("CMD: %s\n", input_buf);
 
-              // Parse "send <IP> <File>" manually to handle quotes/spaces
-              char cmd[16] = {0};
-              char ip_str[64] = {0};
-              char fname[256] = {0};
+                // Parse "send <IP> <File>" manually to handle quotes/spaces
+                char cmd[16] = {0};
+                char ip_str[64] = {0};
+                char fname[256] = {0};
 
-              char *s = input_buf;
+                char *s = input_buf;
 
-              // 1. Skip leading whitespace
-              while (*s && *s <= 32)
-                s++;
+                // 1. Skip leading whitespace
+                while (*s && *s <= 32)
+                  s++;
 
-              // 2. Parse Command
-              int i = 0;
-              while (*s && *s > 32 && i < 15)
-                cmd[i++] = *s++;
-              cmd[i] = 0;
+                // 2. Parse Command
+                int i = 0;
+                while (*s && *s > 32 && i < 15)
+                  cmd[i++] = *s++;
+                cmd[i] = 0;
 
-              // 3. Skip whitespace
-              while (*s && *s <= 32)
-                s++;
+                // 3. Skip whitespace
+                while (*s && *s <= 32)
+                  s++;
 
-              // 4. Parse IP
-              i = 0;
-              while (*s && *s > 32 && i < 63)
-                ip_str[i++] = *s++;
-              ip_str[i] = 0;
-
-              // 5. Skip whitespace
-              while (*s && *s <= 32)
-                s++;
-
-              // 6. Parse Filename (Handle Quotes)
-              if (*s == '\"') {
-                s++; // Skip open quote
+                // 4. Parse IP
                 i = 0;
-                while (*s && *s != '\"' && i < 255)
-                  fname[i++] = *s++;
-                if (*s == '\"')
-                  s++; // Skip close quote
-              } else {
-                i = 0;
-                while (*s && *s >= 32 && i < 255)
-                  fname[i++] = *s++; // Take rest of line
-                // Trim trailing whitespace?
-                while (i > 0 && fname[i - 1] <= 32)
-                  i--;
-              }
-              fname[i] = 0;
+                while (*s && *s > 32 && i < 63)
+                  ip_str[i++] = *s++;
+                ip_str[i] = 0;
 
-              if (cmd[0]) {
-                if (strcmp(cmd, "send") == 0) {
-                  if (ip_str[0] && fname[0]) {
-                    state_event_t ev;
-                    ev.type = EVENT_USER_COMMAND;
+                // 5. Skip whitespace
+                while (*s && *s <= 32)
+                  s++;
 
-                    struct in_addr addr;
-                    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
-                      ev.cmd_send.target_ip = addr.s_addr;
+                // 6. Parse Filename (Handle Quotes)
+                if (*s == '\"') {
+                  s++; // Skip open quote
+                  i = 0;
+                  while (*s && *s != '\"' && i < 255)
+                    fname[i++] = *s++;
+                  if (*s == '\"')
+                    s++; // Skip close quote
+                } else {
+                  i = 0;
+                  while (*s && *s >= 32 && i < 255)
+                    fname[i++] = *s++; // Take rest of line
+                  // Trim trailing whitespace?
+                  while (i > 0 && fname[i - 1] <= 32)
+                    i--;
+                }
+                fname[i] = 0;
 
-                      // Get File Size/Hash
-                      FILE *f = fopen(fname, "rb");
-                      if (f) {
-                        fseeko(f, 0, SEEK_END);
-                        ev.cmd_send.file_size =
-                            (u64)ftello(f); // ftello for large files?
-                        fclose(f);
-                        strncpy(ev.cmd_send.filename, fname, 255);
-                        ev.cmd_send.file_hash_low = 0xCAFEBABE;
+                if (cmd[0]) {
+                  if (strcmp(cmd, "send") == 0) {
+                    if (ip_str[0] && fname[0]) {
+                      state_event_t ev;
+                      ev.type = EVENT_USER_COMMAND;
 
-                        state_update(&g_ctx, &ev, platform_get_time_ms());
+                      struct in_addr addr;
+                      if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                        ev.cmd_send.target_ip = addr.s_addr;
+
+                        // Get File Size/Hash
+                        FILE *f = fopen(fname, "rb");
+                        if (f) {
+                          fseeko(f, 0, SEEK_END);
+                          ev.cmd_send.file_size =
+                              (u64)ftello(f); // ftello for large files?
+                          fclose(f);
+                          strncpy(ev.cmd_send.filename, fname, 255);
+                          ev.cmd_send.file_hash_low = 0xCAFEBABE;
+
+                          state_update(&g_ctx, &ev, platform_get_time_ms());
+                        } else {
+                          printf("Error: File not found: %s\n", fname);
+                        }
                       } else {
-                        printf("Error: File not found: %s\n", fname);
+                        printf("Error: Invalid IP\n");
                       }
                     } else {
-                      printf("Error: Invalid IP\n");
+                      printf("Usage: send <IP> <File>\n");
                     }
-                  } else {
-                    printf("Usage: send <IP> <File>\n");
-                  }
-                } else if (strcmp(cmd, "debug") == 0) {
-                  if (strcmp(ip_str, "on") == 0 || strcmp(ip_str, "1") == 0) {
-                    g_ctx.debug_enabled = true;
-                    printf("Debug Mode: ON\n");
-                  } else if (strcmp(ip_str, "off") == 0 ||
-                             strcmp(ip_str, "0") == 0) {
-                    g_ctx.debug_enabled = false;
-                    printf("Debug Mode: OFF\n");
-                  } else {
-                    printf("Usage: debug <on|off>\n");
+                  } else if (strcmp(cmd, "debug") == 0) {
+                    if (strcmp(ip_str, "on") == 0 || strcmp(ip_str, "1") == 0) {
+                      g_ctx.debug_enabled = true;
+                      printf("Debug Mode: ON\n");
+                    } else if (strcmp(ip_str, "off") == 0 ||
+                               strcmp(ip_str, "0") == 0) {
+                      g_ctx.debug_enabled = false;
+                      printf("Debug Mode: OFF\n");
+                    } else {
+                      printf("Usage: debug <on|off>\n");
+                    }
                   }
                 }
+                input_pos = 0;
               }
-              input_pos = 0;
+              printf("> ");
+              fflush(stdout);
+            } else if (c >= 32 && c <= 126 &&
+                       input_pos < sizeof(input_buf) - 1) {
+              input_buf[input_pos++] = c;
+              // printf("%c", c); // Local echo? Depends on terminal mode.
+              // Usually local echo is on, so we don't print.
             }
-            printf("> ");
-            fflush(stdout);
-          } else if (c >= 32 && c <= 126 && input_pos < sizeof(input_buf) - 1) {
-            input_buf[input_pos++] = c;
-            // printf("%c", c); // Local echo? Depends on terminal mode.
-            // Usually local echo is on, so we don't print.
           }
         }
       }
     }
-  }
+  } // End of while(1)
 
   return 0;
 }
-
 #endif // !_WIN32
