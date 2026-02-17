@@ -441,55 +441,51 @@ static void handle_io_request(PlatformSocket sock) {
         printf("Error: Write IO failed for %s\n", full_path);
       }
     }
-  }
-}
-else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
-  char ip_str[64];
-  struct in_addr addr;
-  addr.s_addr = g_ctx.io_peer_ip;
-  inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+  } else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+    char ip_str[64];
+    struct in_addr addr;
+    addr.s_addr = g_ctx.io_peer_ip;
+    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
 
-  PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
-  if (sock != PLATFORM_INVALID_SOCKET) {
+    PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
+    if (sock != PLATFORM_INVALID_SOCKET) {
+      for (int i = 0; i < JOBS_MAX; ++i) {
+        if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+          g_ctx.jobs_active[i].tcp_socket = (u64)sock;
+          break;
+        }
+      }
+    } else {
+      printf("Error: TCP Connect failed to %s\n", ip_str);
+      state_event_t ev;
+      ev.type = EVENT_TCP_CONNECTED;
+      ev.tcp.socket = 0;
+      ev.tcp.success = false;
+      state_update(&g_ctx, &ev, platform_get_time_ms());
+    }
+  } else if (g_ctx.io_req_type == IO_TCP_SEND) {
+    PlatformSocket sock = PLATFORM_INVALID_SOCKET;
     for (int i = 0; i < JOBS_MAX; ++i) {
       if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
-        g_ctx.jobs_active[i].tcp_socket = (u64)sock;
+        sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
         break;
       }
     }
-  } else {
-    printf("Error: TCP Connect failed to %s\n", ip_str);
-    state_event_t ev;
-    ev.type = EVENT_TCP_CONNECTED;
-    ev.tcp.socket = 0;
-    ev.tcp.success = false;
-    state_update(&g_ctx, &ev, platform_get_time_ms());
-  }
-}
-else if (g_ctx.io_req_type == IO_TCP_SEND) {
-  PlatformSocket sock = PLATFORM_INVALID_SOCKET;
-  for (int i = 0; i < JOBS_MAX; ++i) {
-    if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
-      sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
-      break;
+
+    if (sock != PLATFORM_INVALID_SOCKET) {
+      int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
+      if (result < 0) {
+        printf("Error: TCP Send Failed\n");
+      } else {
+        if (g_ctx.debug_enabled)
+          printf("DEBUG: TCP Sent %d bytes\n", result);
+      }
     }
+  } else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
+    // Close logic
   }
 
-  if (sock != PLATFORM_INVALID_SOCKET) {
-    int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
-    if (result < 0) {
-      printf("Error: TCP Send Failed\n");
-    } else {
-      if (g_ctx.debug_enabled)
-        printf("DEBUG: TCP Sent %d bytes\n", result);
-    }
-  }
-}
-else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
-  // Close logic
-}
-
-g_ctx.io_req_type = IO_NONE; // Clear
+  g_ctx.io_req_type = IO_NONE; // Clear
 }
 
 int main(int argc, char **argv) {
@@ -738,13 +734,13 @@ int main(int argc, char **argv) {
                   // If EWOULDBLOCK, it returned 0?
                   // I checked platform_tcp_recv: returns 0 on EWOULDBLOCK.
                   // This is ambiguous!
-                  // Fix: platform_tcp_recv should return -1 on error (including
-                  // wouldblock) or handle distinct. Actually, standard recv
-                  // returns 0 on FIN. My helper returns 0 on EWOULDBLOCK. Bad
-                  // design. Since POLLIN signaled, EWOULDBLOCK is unlikely
-                  // unless spurious. Note: If I receive 0 bytes and it was
-                  // EWOULDBLOCK, I can't distinguish from Close. Let's assume
-                  // Close for 0.
+                  // Fix: platform_tcp_recv should return -1 on error
+                  // (including wouldblock) or handle distinct. Actually,
+                  // standard recv returns 0 on FIN. My helper returns 0 on
+                  // EWOULDBLOCK. Bad design. Since POLLIN signaled,
+                  // EWOULDBLOCK is unlikely unless spurious. Note: If I
+                  // receive 0 bytes and it was EWOULDBLOCK, I can't
+                  // distinguish from Close. Let's assume Close for 0.
                   state_event_t ev;
                   ev.type = EVENT_TCP_CLOSED;
                   ev.tcp.socket = (u64)s;
