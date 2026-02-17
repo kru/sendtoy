@@ -67,9 +67,11 @@ PRECISE_ASSERT(sizeof(peer_advert_t) == 40); // 32 + 4 + 2 + 2
 typedef struct TIGER_ALIGN(8) msg_offer {
     u64 file_size;
     u64 file_hash_low; // First 64 bits of hash for verification
+    u32 job_id;        // Sender's Job ID
     u32 timestamp;
     u32 name_len;
     char name[256]; // Fixed buffer for simplicity
+    u32 padding;    // Align to 8 bytes (Total 288)
 } msg_offer_t;
 
 typedef struct TIGER_ALIGN(8) msg_request {
@@ -105,6 +107,7 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u64 start_time;
   u32 state; // job_state_e
   u32 id;
+  u32 peer_job_id;
   
   // Filename for Platform IO
   char filename[256];
@@ -113,9 +116,9 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u64 block_bitmap[BITMAP_SIZE_U64];
 
   // Keep alignment to 64 bytes
-  // Current size: 32+32+8+8+8+4+4 (96) + 256 + 8192 = 8544 bytes.
-  // 8544 % 64 = 32. Need 32 bytes padding.
-  u8 padding[32];
+  // Current size: 32+32+8+8+8+4+4 (96) + 4 (peer_id) = 100 + 256 + 8192 = 8548.
+  // 8548 % 64 = 36. Need 28 bytes padding.
+  u8 padding[28];
 } transfer_job_t;
 
 PRECISE_ASSERT(sizeof(transfer_job_t) % 64 == 0);

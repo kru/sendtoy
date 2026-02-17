@@ -94,60 +94,71 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         // Find free job for Receiver
         for (int i = 0; i < JOBS_MAX; ++i) {
              if (ctx->jobs_active[i].state == JOB_STATE_FREE) {
-                 transfer_job_t* job = &ctx->jobs_active[i];
-                 job->state = JOB_STATE_TRANSFERRING;
-                 // receiver job? we need to distinguish sender/receiver in job struct?
-                 // For now, implicit: if we have file_size but bytes_transferred < size, we are working.
-                 // But wait, sender also has these.
-                 // Let's assume OFFER reception implies we are Sink.
-                 job->file_size = offer->file_size;
-                 job->file_hash[0] = (u8)offer->file_hash_low;
-                 job->bytes_transferred = 0;
-                 
-                 // Store Filename
-                 u32 fname_len = offer->name_len;
-                 if (fname_len > 255) fname_len = 255;
-                 memcpy(job->filename, offer->name, fname_len);
-                 job->filename[fname_len] = 0;
-                 
-                 // Immediately Request First Chunk (Offset 0)
-                 msg_request_t req = {0};
-                 req.job_id = 0; // TODO: Negotiation
-                 req.len = 1024; // 1KB chunks for MVP
-                 req.offset = 0;
-                 
-                 packet_header_t req_header = {0};
-                 req_header.magic = MAGIC_TOYS;
-                 req_header.type = PACKET_TYPE_CHUNK_REQ;
-                 req_header.body_length = sizeof(msg_request_t);
-                 
-                 if (sizeof(packet_header_t) + sizeof(msg_request_t) <= sizeof(ctx->outbox)) {
-                    memcpy(ctx->outbox, &req_header, sizeof(packet_header_t));
-                    memcpy(ctx->outbox + sizeof(packet_header_t), &req, sizeof(msg_request_t));
-                    ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_request_t);
-                    
-                    // Respond to sender
-                    ctx->io_peer_ip = event->packet.from_ip;
-                    ctx->io_peer_port = event->packet.from_port; // Or configured target port?
-                    // Usually respond to sender's port if UDP hole punching, but here we use fixed config port for simplicity
-                    ctx->io_peer_port = ctx->config_target_port;
-                 }
-                 break;
-             }
-        }
+                  transfer_job_t* job = &ctx->jobs_active[i];
+                  job->state = JOB_STATE_TRANSFERRING;
+                  // receiver job? we need to distinguish sender/receiver in job struct?
+                  // For now, implicit: if we have file_size but bytes_transferred < size, we are working.
+                  // But wait, sender also has these.
+                  // Let's assume OFFER reception implies we are Sink.
+                  job->file_size = offer->file_size;
+                  job->file_hash[0] = (u8)offer->file_hash_low;
+                  job->bytes_transferred = 0;
+                  job->peer_job_id = offer->job_id;
+                  
+                  // Store Filename
+                  u32 fname_len = offer->name_len;
+                  if (fname_len > 255) fname_len = 255;
+                  memcpy(job->filename, offer->name, fname_len);
+                  job->filename[fname_len] = 0;
+                  
+                  // Immediately Request First Chunk (Offset 0)
+                  msg_request_t req = {0};
+                  req.job_id = job->peer_job_id;
+                  req.len = 1024; // 1KB chunks for MVP
+                  req.offset = 0;
+                  
+                  packet_header_t req_header = {0};
+                  req_header.magic = MAGIC_TOYS;
+                  req_header.type = PACKET_TYPE_CHUNK_REQ;
+                  req_header.body_length = sizeof(msg_request_t);
+                  
+                  if (sizeof(packet_header_t) + sizeof(msg_request_t) <= sizeof(ctx->outbox)) {
+                     memcpy(ctx->outbox, &req_header, sizeof(packet_header_t));
+                     memcpy(ctx->outbox + sizeof(packet_header_t), &req, sizeof(msg_request_t));
+                     ctx->outbox_len = sizeof(packet_header_t) + sizeof(msg_request_t);
+                     
+                     // Respond to sender
+                     ctx->io_peer_ip = event->packet.from_ip;
+                     ctx->io_peer_port = event->packet.from_port; // Or configured target port?
+                     // Usually respond to sender's port if UDP hole punching, but here we use fixed config port for simplicity
+                     ctx->io_peer_port = ctx->config_target_port;
+                  }
+                  break;
+              }
+         }
     } else if (header->type == PACKET_TYPE_CHUNK_REQ) {
         if (body_len < sizeof(msg_request_t)) return;
         const msg_request_t* req = (const msg_request_t*)body;
         
-        // Ensure we are in Sender Mode (Job ID check? For MVP just check state)
-        // Find Job (Sender)
-        // For MVP, simplistic: assume request is valid for the file we are sending.
+        // Ensure we are in Sender Mode
+        // Lookup job by ID from request
+        transfer_job_t* job = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (ctx->jobs_active[i].state == JOB_STATE_OFFER_SENT && 
+                 ctx->jobs_active[i].id == req->job_id) {
+                 job = &ctx->jobs_active[i];
+                 break;
+             }
+        }
         
-        // TigerStyle: Validate Input
-        // if (ctx->jobs_active[req->job_id].state != JOB_STATE_OFFER_SENT) return;
-        
+        if (!job) {
+             if (ctx->debug_enabled) printf("DEBUG: Ignored REQ for unknown Job ID %u\n", req->job_id);
+             return;
+        }
+
         // Signal Platform to Read & Send
         ctx->io_req_type = IO_READ_CHUNK;
+        ctx->io_req_job_id = job->id;
         ctx->io_req_offset = req->offset;
         ctx->io_req_len = req->len;
         if (ctx->io_req_len > 1024) ctx->io_req_len = 1024; // Clamp
@@ -155,7 +166,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
         ctx->io_peer_ip = event->packet.from_ip;
         ctx->io_peer_port = ctx->config_target_port; // Or from packet
         
-        if (ctx->debug_enabled) printf("DEBUG: Recv REQ Offset %llu Len %u\n", req->offset, req->len);
+        if (ctx->debug_enabled) printf("DEBUG: Recv REQ Offset %llu Len %u Job %u\n", req->offset, req->len, req->job_id);
         
     } else if (header->type == PACKET_TYPE_CHUNK_DATA) {
         if (body_len < sizeof(msg_data_t)) return;
@@ -188,7 +199,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event) {
              // Request Next Chunk immediately if not done
              if (job->bytes_transferred < job->file_size) {
                  msg_request_t req = {0};
-                 req.job_id = job->id;
+                 req.job_id = job->peer_job_id;
                  req.len = 1024;
                  req.offset = data_msg->offset + data_len;
                  
@@ -279,6 +290,7 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event) {
                     msg_offer_t offer = {0};
                     offer.file_size = event->cmd_send.file_size;
                     offer.file_hash_low = event->cmd_send.file_hash_low;
+                    offer.job_id = job->id;
                     
                     const char* base_name = get_basename(event->cmd_send.filename);
                     offer.name_len = (u32)strlen(base_name);
@@ -311,5 +323,3 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event) {
 
     return changed;
 }
-
-
