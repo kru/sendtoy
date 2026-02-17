@@ -272,6 +272,14 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[65536];
 
+// TigerStyle: TCP Stream Reassembly Buffers
+typedef struct {
+    u8 buffer[65536 + 4096]; 
+    u32 len;
+} JobRxBuffer;
+
+static JobRxBuffer g_job_rx[JOBS_MAX];
+
 // Helper to get Downloads path
 static void get_downloads_path(char* out_buf, size_t size) {
     const char* home_dir = getenv("HOME");
@@ -287,20 +295,26 @@ static void handle_io_request(PlatformSocket sock) {
     if (g_ctx.io_req_type == IO_NONE) return;
 
     if (g_ctx.io_req_type == IO_READ_CHUNK) {
+        // Find filename and Job
         char* fname = NULL;
+        transfer_job_t* job = NULL;
+
         for (int i = 0; i < JOBS_MAX; ++i) {
              if (g_ctx.jobs_active[i].state != JOB_STATE_FREE && 
                  g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) { 
                  fname = g_ctx.jobs_active[i].filename;
+                 job = &g_ctx.jobs_active[i];
                  break;
              }
         }
         
+        // Fallback for MVP
         if (!fname) {
              for (int i = 0; i < JOBS_MAX; ++i) {
                  if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT || 
                      g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
                      fname = g_ctx.jobs_active[i].filename;
+                     job = &g_ctx.jobs_active[i];
                      if (g_ctx.debug_enabled) printf("DEBUG: IO Read Fallback to Job %d File '%s'\n", i, fname);
                      break;
                  }
@@ -312,8 +326,6 @@ static void handle_io_request(PlatformSocket sock) {
             if (f) {
                 fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
                 
-                // Read into work_buffer (Up to 1MB)
-                // Ensure request fits in work_buffer (4MB)
                 size_t read_len = g_ctx.io_req_len;
                 if (read_len > sizeof(g_ctx.work_buffer)) read_len = sizeof(g_ctx.work_buffer);
                 
@@ -321,50 +333,89 @@ static void handle_io_request(PlatformSocket sock) {
                 fclose(f);
                 
                 if (read > 0) {
-                    // Burst Send Loop
-                    // Split into MTU sized chunks (e.g. 1400 bytes payload)
-                    const size_t CHUNK_MTU = 1400;
-                    size_t offset = 0;
-                    
-                    char ip_str[64];
-                    struct in_addr addr;
-                    addr.s_addr = g_ctx.io_peer_ip;
-                    inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-                    
-                    while (offset < read) {
-                        size_t chunk_len = read - offset;
-                        if (chunk_len > CHUNK_MTU) chunk_len = CHUNK_MTU;
-                        
-                        packet_header_t header = {0};
-                        header.magic = MAGIC_TOYS;
-                        header.type = PACKET_TYPE_CHUNK_DATA;
-                        
-                        msg_data_t data_msg = {0};
-                        data_msg.offset = g_ctx.io_req_offset + offset;
-                        data_msg.job_id = 0; // Sender ID?
-                        
-                        header.body_length = sizeof(msg_data_t) + chunk_len;
-                        
-                        // Copy to outbox
-                        u8* ptr = g_ctx.outbox;
-                        memcpy(ptr, &header, sizeof(packet_header_t));
-                        memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
-                        memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
-                               g_ctx.work_buffer + offset, chunk_len);
-                               
-                        size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
-                        
-                        platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str, g_ctx.io_peer_port);
-                        
-                        offset += chunk_len;
-                        
-                        // Pacing: Sleep 1ms every 32 packets
-                        if ((offset / chunk_len) % 32 == 0) {
-                            usleep(1000); 
+                    if (job && job->tcp_socket != 0 && job->tcp_socket != PLATFORM_INVALID_SOCKET) {
+                        // ** TCP Fast Path **
+                        // Segment into 64KB chunks to fit in our RX buffers
+                        const size_t TCP_CHUNK_SIZE = 65536 - sizeof(packet_header_t) - sizeof(msg_data_t) - 128; // Safe margin
+                        size_t offset = 0;
+                        PlatformSocket s = (PlatformSocket)job->tcp_socket;
+
+                        while (offset < read) {
+                            size_t chunk_len = read - offset;
+                            if (chunk_len > TCP_CHUNK_SIZE) chunk_len = TCP_CHUNK_SIZE;
+                            
+                            packet_header_t header = {0};
+                            header.magic = MAGIC_TOYS;
+                            header.type = PACKET_TYPE_CHUNK_DATA;
+                            
+                            msg_data_t data_msg = {0};
+                            data_msg.offset = g_ctx.io_req_offset + offset;
+                            data_msg.job_id = job->id; 
+                            
+                            header.body_length = sizeof(msg_data_t) + chunk_len;
+                            
+                            u8* ptr = g_ctx.outbox;
+                            memcpy(ptr, &header, sizeof(packet_header_t));
+                            memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
+                                   g_ctx.work_buffer + offset, chunk_len);
+                                   
+                            size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
+                            
+                            int res = platform_tcp_send(s, ptr, packet_len);
+                            if (res < 0) {
+                                printf("Error: TCP Send Failed during chunk xfer. Closing.\n");
+                                break;
+                            }
+                            
+                            offset += chunk_len;
+                            // NO SLEEP!
                         }
+                        if (g_ctx.debug_enabled) printf("DEBUG: TCP Stream Sent %zu bytes\n", read);
+
+                    } else {
+                        // ** UDP Fallback Path **
+                        const size_t CHUNK_MTU = 1400;
+                        size_t offset = 0;
+                        
+                        char ip_str[64];
+                        struct in_addr addr;
+                        addr.s_addr = g_ctx.io_peer_ip;
+                        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+                        
+                        while (offset < read) {
+                            size_t chunk_len = read - offset;
+                            if (chunk_len > CHUNK_MTU) chunk_len = CHUNK_MTU;
+                            
+                            packet_header_t header = {0};
+                            header.magic = MAGIC_TOYS;
+                            header.type = PACKET_TYPE_CHUNK_DATA;
+                            
+                            msg_data_t data_msg = {0};
+                            data_msg.offset = g_ctx.io_req_offset + offset;
+                            data_msg.job_id = 0; 
+                            
+                            header.body_length = sizeof(msg_data_t) + chunk_len;
+                            
+                            u8* ptr = g_ctx.outbox;
+                            memcpy(ptr, &header, sizeof(packet_header_t));
+                            memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
+                                   g_ctx.work_buffer + offset, chunk_len);
+                                   
+                            size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
+                            
+                            platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str, g_ctx.io_peer_port);
+                            
+                            offset += chunk_len;
+                            
+                            // Pacing: Sleep 1ms every 32 packets
+                            if ((offset / chunk_len) % 32 == 0) {
+                                usleep(1000); 
+                            }
+                        }
+                        if (g_ctx.debug_enabled) printf("DEBUG: UDP Burst Sent %zu bytes to %s\n", read, ip_str);
                     }
-                    
-                    if (g_ctx.debug_enabled) printf("DEBUG: Burst Sent %zu bytes to %s\n", read, ip_str);
                 }
             } else {
                 printf("Error: Read IO failed for '%s'\n", fname);
@@ -686,41 +737,66 @@ int main(int argc, char **argv) {
                             }
                             // Check Data
                             else if (fds[i].revents & POLLIN) {
-                                int n = platform_tcp_recv(s, g_net_rx_buffer, sizeof(g_net_rx_buffer));
-                                if (n > 0) {
-                                     state_event_t ev;
-                                     ev.type = EVENT_TCP_DATA;
-                                     ev.tcp.socket = (u64)s;
-                                     ev.tcp.data = g_net_rx_buffer;
-                                     ev.tcp.len = (u32)n;
-                                     state_update(&g_ctx, &ev, platform_get_time_ms());
-                                     handle_io_request(udp_sock);
-                                } else if (n == 0) {
-                                    // 0 on recv usually means closed. 
-                                    // But check platform_tcp_recv logic.
-                                    // If EWOULDBLOCK, it returned 0? 
-                                    // I checked platform_tcp_recv: returns 0 on EWOULDBLOCK.
-                                    // This is ambiguous!
-                                    // Fix: platform_tcp_recv should return -1 on error (including wouldblock) or handle distinct.
-                                    // Actually, standard recv returns 0 on FIN.
-                                    // My helper returns 0 on EWOULDBLOCK. Bad design.
-                                    // Since POLLIN signaled, EWOULDBLOCK is unlikely unless spurious.
-                                    // Note: If I receive 0 bytes and it was EWOULDBLOCK, I can't distinguish from Close.
-                                    // Let's assume Close for 0.
-                                     state_event_t ev;
-                                     ev.type = EVENT_TCP_CLOSED;
-                                     ev.tcp.socket = (u64)s;
-                                     state_update(&g_ctx, &ev, platform_get_time_ms());
-                                     close(s);
-                                     g_ctx.jobs_active[j].tcp_socket = 0;
-                                } else {
-                                     // Error
-                                     state_event_t ev;
-                                     ev.type = EVENT_TCP_CLOSED;
-                                     ev.tcp.socket = (u64)s;
-                                     state_update(&g_ctx, &ev, platform_get_time_ms());
-                                     close(s);
-                                     g_ctx.jobs_active[j].tcp_socket = 0;
+                                JobRxBuffer* rx = &g_job_rx[j];
+                                int space = sizeof(rx->buffer) - rx->len;
+                                if (space > 0) {
+                                    int n = platform_tcp_recv(s, rx->buffer + rx->len, space);
+                                    if (n > 0) {
+                                        rx->len += n;
+                                        
+                                        // Framing Loop
+                                        while (rx->len >= sizeof(packet_header_t)) {
+                                            packet_header_t* head = (packet_header_t*)rx->buffer;
+                                            if (head->magic != MAGIC_TOYS) {
+                                                printf("DEBUG: TCP Magic Mismatch! Closing.\n");
+                                                state_event_t ev;
+                                                ev.type = EVENT_TCP_CLOSED;
+                                                ev.tcp.socket = (u64)s;
+                                                state_update(&g_ctx, &ev, platform_get_time_ms());
+                                                close(s);
+                                                g_ctx.jobs_active[j].tcp_socket = 0;
+                                                rx->len = 0;
+                                                break;
+                                            }
+                                            
+                                            u32 packet_len = sizeof(packet_header_t) + (u32)head->body_length;
+                                            if (rx->len >= packet_len) {
+                                                state_event_t ev;
+                                                ev.type = EVENT_TCP_DATA;
+                                                ev.tcp.socket = (u64)s;
+                                                ev.tcp.data = rx->buffer;
+                                                ev.tcp.len = packet_len;
+                                                state_update(&g_ctx, &ev, platform_get_time_ms());
+                                                handle_io_request(udp_sock);
+                                                
+                                                u32 remaining = rx->len - packet_len;
+                                                if (remaining > 0) {
+                                                    memmove(rx->buffer, rx->buffer + packet_len, remaining);
+                                                }
+                                                rx->len = remaining;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    } else if (n == 0) {
+                                        // Close
+                                        state_event_t ev;
+                                        ev.type = EVENT_TCP_CLOSED;
+                                        ev.tcp.socket = (u64)s;
+                                        state_update(&g_ctx, &ev, platform_get_time_ms());
+                                        close(s);
+                                        g_ctx.jobs_active[j].tcp_socket = 0;
+                                        rx->len = 0;
+                                    } else {
+                                        // Error
+                                        state_event_t ev;
+                                        ev.type = EVENT_TCP_CLOSED;
+                                        ev.tcp.socket = (u64)s;
+                                        state_update(&g_ctx, &ev, platform_get_time_ms());
+                                        close(s);
+                                        g_ctx.jobs_active[j].tcp_socket = 0;
+                                        rx->len = 0;
+                                    }
                                 }
                             }
                         }

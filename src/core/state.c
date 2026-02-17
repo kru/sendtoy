@@ -191,7 +191,7 @@ static void handle_packet(ctx_main_t* ctx, const state_event_t* event, u64 now) 
                   msg_request_t req = {0};
                   req.job_id = job->peer_job_id;
                   
-                  u64 req_len = FILE_CHUNK_SIZE;
+                  u64 req_len = (4 * 1024 * 1024); // Request 4MB Window
                   if (req_len > job->file_size) req_len = job->file_size;
                   req.len = (u32)req_len;
                   req.offset = 0;
