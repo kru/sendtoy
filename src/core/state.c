@@ -1,5 +1,6 @@
 #include "types.h"
 #include <string.h> // for memcmp, memcpy
+#include <stdlib.h> // for rand
 #include <stdio.h> // Debug
 
 // ... (rest of file)
@@ -228,6 +229,17 @@ void state_init(ctx_main_t* ctx) {
     ctx->debug_enabled = true;
 }
 
+// Helper to extract filename from path (handles / and \)
+static const char* get_basename(const char* path) {
+    const char* base = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
 bool state_update(ctx_main_t* ctx, const state_event_t* event) {
     bool changed = false;
 
@@ -267,9 +279,12 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event) {
                     msg_offer_t offer = {0};
                     offer.file_size = event->cmd_send.file_size;
                     offer.file_hash_low = event->cmd_send.file_hash_low;
-                    offer.name_len = (u32)strlen(event->cmd_send.filename);
+                    
+                    const char* base_name = get_basename(event->cmd_send.filename);
+                    offer.name_len = (u32)strlen(base_name);
+                    
                     if (offer.name_len > 255) offer.name_len = 255;
-                    memcpy(offer.name, event->cmd_send.filename, offer.name_len);
+                    memcpy(offer.name, base_name, offer.name_len);
                     
                     packet_header_t header = {0};
                     header.magic = MAGIC_TOYS;

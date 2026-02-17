@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -191,6 +192,16 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[1500];
 
+// Helper to get Downloads path
+static void get_downloads_path(char* out_buf, size_t size) {
+    const char* home_dir = getenv("HOME");
+    if (home_dir) {
+        snprintf(out_buf, size, "%s/Downloads", home_dir);
+    } else {
+        strncpy(out_buf, ".", size);
+    }
+}
+
 // TigerStyle: Handle IO Requests from State Machine
 static void handle_io_request(PlatformSocket sock) {
     if (g_ctx.io_req_type == IO_NONE) return;
@@ -262,16 +273,29 @@ static void handle_io_request(PlatformSocket sock) {
         }
         
         if (fname) {
-            FILE* f = fopen(fname, "r+b");
-            if (!f) f = fopen(fname, "wb"); 
+            // Construct full path to Downloads
+            char full_path[512];
+            char down_path[256];
+            get_downloads_path(down_path, sizeof(down_path));
+            
+            // Ensure dir exists
+            struct stat st = {0};
+            if (stat(down_path, &st) == -1) {
+                mkdir(down_path, 0755);
+            }
+            
+            snprintf(full_path, sizeof(full_path), "%s/%s", down_path, fname);
+            
+            FILE* f = fopen(full_path, "r+b");
+            if (!f) f = fopen(full_path, "wb"); 
             
             if (f) {
                 fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
                 fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
                 fclose(f);
-                if (g_ctx.debug_enabled) printf("DEBUG: Wrote Chunks %llu\n", g_ctx.io_req_offset);
+                if (g_ctx.debug_enabled) printf("DEBUG: Wrote Chunks %llu to %s\n", g_ctx.io_req_offset, full_path);
             } else {
-                printf("Error: Write IO failed for %s\n", fname);
+                printf("Error: Write IO failed for %s\n", full_path);
             }
         }
     }

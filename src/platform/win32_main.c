@@ -184,6 +184,16 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[1500]; // Standard MTU
 
+// Helper to get Downloads path (Simple version using env var)
+static void get_downloads_path(char* out_buf, size_t size) {
+    const char* user_profile = getenv("USERPROFILE");
+    if (user_profile) {
+        snprintf(out_buf, size, "%s\\Downloads", user_profile);
+    } else {
+        strncpy(out_buf, ".", size);
+    }
+}
+
 // TigerStyle: Handle IO Requests from State Machine
 static void handle_io_request(PlatformSocket sock) {
     if (g_ctx.io_req_type == IO_NONE) return;
@@ -275,22 +285,26 @@ static void handle_io_request(PlatformSocket sock) {
         }
         
         if (fname) {
-            // "r+b" for updating, "wb" key to ensure creation if not exists?
-            // "r+b" fails if file doesn't exist. "wb" truncates.
-            // We need "Open if exists, else Create" without truncate.
-            // On Windows: `fopen` "ab"? No, that appends.
-            // Standard C `fopen` is tricky for "Open or Create".
-            // Try "r+b", if NULL, then "wb".
-            FILE* f = fopen(fname, "r+b");
-            if (!f) f = fopen(fname, "wb"); 
+            // Construct full path to Downloads
+            char full_path[512];
+            char down_path[256];
+            get_downloads_path(down_path, sizeof(down_path));
+            
+            // Ensure dir exists
+            CreateDirectoryA(down_path, NULL);
+            
+            snprintf(full_path, sizeof(full_path), "%s\\%s", down_path, fname);
+            
+            FILE* f = fopen(full_path, "r+b");
+            if (!f) f = fopen(full_path, "wb"); 
             
             if (f) {
                 fseek(f, (long)g_ctx.io_req_offset, SEEK_SET);
                 fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
                 fclose(f);
-                if (g_ctx.debug_enabled) printf("DEBUG: Wrote Chunks %llu\n", g_ctx.io_req_offset);
+                if (g_ctx.debug_enabled) printf("DEBUG: Wrote Chunks %llu to %s\n", g_ctx.io_req_offset, full_path);
             } else {
-                printf("Error: Write IO failed for %s\n", fname);
+                printf("Error: Write IO failed for %s\n", full_path);
             }
         }
     }
