@@ -206,6 +206,7 @@ int platform_tcp_send(PlatformSocket sock, const void* data, size_t len) {
                 Sleep(1); 
                 continue;
             }
+            printf("Error: send() failed WSA=%d\n", err);
             return -1;
         }
         if (sent == 0) return -1; // Connection closed?
@@ -548,7 +549,11 @@ static void handle_io_request(PlatformSocket sock) {
                 
                 DWORD bytes_read = 0;
                 BOOL ok = ReadFile(hf, g_ctx.work_buffer, to_read, &bytes_read, NULL);
-                if (!ok || bytes_read == 0) break;
+                if (!ok || bytes_read == 0) {
+                    if (!ok) printf("Error: ReadFile failed (err %lu)\n", GetLastError());
+                    break;
+                }
+                if (outer == 0) printf("Streaming: first read %lu bytes, total_to_send=%llu\n", bytes_read, total_to_send);
                 
                 // Segment into TCP packets and send
                 u32 seg_offset = 0;
@@ -578,7 +583,8 @@ static void handle_io_request(PlatformSocket sock) {
                     
                     int res = platform_tcp_send(s, ptr, packet_len);
                     if (res < 0) {
-                        printf("Error: TCP Stream Send Failed. Closing.\n");
+                        printf("Error: TCP Stream Send Failed (pkt=%u, seg=%u/%u, iter=%u). Closing.\n",
+                               packet_len, inner, max_inner, outer);
                         job->state = JOB_STATE_FAILED;
                         goto stream_done;
                     }
