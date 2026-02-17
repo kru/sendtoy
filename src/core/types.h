@@ -123,20 +123,18 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u64 requested_offset;      // The offset up to which we have requested data
   u64 last_activity_time;    // For timeouts
   
+  // Persistent file handle (platform-specific, cast to HANDLE/int)
+  u64 file_handle;           // 0 = not open
+  u32 is_streaming;          // 1 = sender is actively streaming this file
+  u32 _pad_stream;
+
   // Filename for Platform IO
   char filename[256];
 
   // Bitmap of completed blocks (1 = complete, 0 = missing)
   u64 block_bitmap[BITMAP_SIZE_U64];
 
-  // Keep alignment to 64 bytes
-  // New fields: u64 (8) + 32 + 24 + 24 = 88 bytes.
-  // Previous padding was 8 bytes.
-  // Total Unpadded Size calculation:
-  // Base (approx 100) + Filename (256) + Bitmap (8192) + New (88) = 8656 bytes (approx).
-  // 8656 % 64 = 16. 
-  // 64 - 16 = 48 bytes padding needed.
-  u8 padding[48]; 
+  u8 padding[32]; 
 } transfer_job_t;
 
 // PRECISE_ASSERT(sizeof(transfer_job_t) % 64 == 0);
@@ -158,7 +156,8 @@ typedef enum {
     // TCP Operations
     IO_TCP_CONNECT = 3,
     IO_TCP_SEND = 4, // Encrypt & Send
-    IO_TCP_CLOSE = 5
+    IO_TCP_CLOSE = 5,
+    IO_STREAM_FILE = 6 // Stream entire file via TCP (sender fast path)
 } io_req_type_e;
 
 // --- Global Context ---

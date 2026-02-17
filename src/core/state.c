@@ -520,16 +520,14 @@ static void handle_tcp_data(ctx_main_t* ctx, u64 socket, u8* data, u32 len) {
              msg_request_t* req = (msg_request_t*)(data + sizeof(packet_header_t));
              if (ctx->debug_enabled) printf("DEBUG: Recv REQ (TCP) Offset %llu\n", req->offset);
              
-             // Start Stream (Read first chunk)
-             // We reuse IO_READ_CHUNK, but Platform needs to know to Send via TCP.
-             // We can check job->tcp_socket in Platform.
-             ctx->io_req_type = IO_READ_CHUNK;
+             // Streaming mode: tell platform to stream entire file from offset
+             job->is_streaming = 1;
+             ctx->io_req_type = IO_STREAM_FILE;
              ctx->io_req_job_id = job->id;
              ctx->io_req_offset = req->offset;
-             ctx->io_req_len = FILE_CHUNK_SIZE;
-             
-             if (ctx->io_req_len > job->file_size - req->offset) {
-                 ctx->io_req_len = (u32)(job->file_size - req->offset);
+             {
+                 u64 remain = job->file_size - req->offset;
+                 ctx->io_req_len = (remain > 0xFFFFFFFF) ? 0xFFFFFFFF : (u32)remain;
              }
         } else if (head->type == PACKET_TYPE_CHUNK_DATA) {
              // Receiver got Data
@@ -575,7 +573,7 @@ static void handle_tcp_data(ctx_main_t* ctx, u64 socket, u8* data, u32 len) {
     }
 }
 
-// Handler for Write Completion
+// Handler for Write Completion (receiver side — completion detection only)
 static void handle_write_complete(ctx_main_t* ctx, u64 job_id) {
     transfer_job_t* job = NULL;
     for(int i=0; i<JOBS_MAX; ++i) {
@@ -585,20 +583,10 @@ static void handle_write_complete(ctx_main_t* ctx, u64 job_id) {
         }
     }
     
-    if (job && job->bytes_transferred < job->file_size) {
-         msg_request_t req = { .job_id = job->peer_job_id, .offset = job->bytes_transferred, .len = 0xFFFFFFFF };
-         packet_header_t rpkt = { .magic = MAGIC_TOYS, .type = PACKET_TYPE_CHUNK_REQ, .body_length = sizeof(req) };
-         
-         memcpy(ctx->work_buffer, &rpkt, sizeof(rpkt));
-         memcpy(ctx->work_buffer + sizeof(rpkt), &req, sizeof(req));
-         
-         ctx->io_req_type = IO_TCP_SEND;
-         ctx->io_req_job_id = job->id;
-         ctx->io_req_len = sizeof(rpkt) + sizeof(req);
-         ctx->io_data_ptr = ctx->work_buffer;
-    } else if (job && job->bytes_transferred >= job->file_size) {
+    // Streaming mode: sender drives the flow, receiver just checks completion
+    if (job && job->bytes_transferred >= job->file_size) {
         if (ctx->debug_enabled) printf("DEBUG: Transfer Complete for Job %d\n", job->id);
-        job->state = JOB_STATE_COMPLETED; // Or cleanup
+        job->state = JOB_STATE_COMPLETED;
     }
 }
 

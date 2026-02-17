@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h> // TCP_NODELAY
 #include <poll.h>
 #include <pthread.h> // POSIX threads
 #include <stdio.h>
@@ -193,6 +194,12 @@ PlatformSocket platform_tcp_connect(const char *ip, uint16_t port) {
   int flags = fcntl(s, F_GETFL, 0);
   fcntl(s, F_SETFL, flags | O_NONBLOCK);
 
+  // Disable Nagle for low latency control messages
+  {
+    int opt = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+  }
+
   struct sockaddr_in dest;
   memset(&dest, 0, sizeof(dest));
   dest.sin_family = AF_INET;
@@ -284,7 +291,7 @@ static u8 g_net_rx_buffer[65536];
 
 // TigerStyle: TCP Stream Reassembly Buffers
 typedef struct {
-  u8 buffer[65536 + 4096];
+  u8 buffer[BUFFER_SIZE_LARGE + 131072]; // 4MB + 128KB headroom
   u32 len;
 } JobRxBuffer;
 
@@ -451,57 +458,169 @@ static void handle_io_request(PlatformSocket sock) {
                g_ctx.io_req_job_id);
     }
   } else if (g_ctx.io_req_type == IO_WRITE_CHUNK) {
-    char *fname = NULL;
+    // Find receiver job
+    transfer_job_t *job = NULL;
     for (int i = 0; i < JOBS_MAX; ++i) {
-      if (g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
-        fname = g_ctx.jobs_active[i].filename;
+      if (g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING &&
+          g_ctx.jobs_active[i].file_size > 0) {
+        job = &g_ctx.jobs_active[i];
         break;
       }
     }
 
-    if (fname) {
-      // Construct full path to Downloads
-      char full_path[512];
-      char down_path[256];
-      get_downloads_path(down_path, sizeof(down_path));
+    if (job) {
+      // Open file handle once (persistent across chunks)
+      if (job->file_handle == 0) {
+        char full_path[512];
+        char down_path[256];
+        get_downloads_path(down_path, sizeof(down_path));
+        struct stat st = {0};
+        if (stat(down_path, &st) == -1) {
+          mkdir(down_path, 0755);
+        }
+        snprintf(full_path, sizeof(full_path), "%s/%s", down_path, job->filename);
 
-      // Ensure dir exists
-      struct stat st = {0};
-      if (stat(down_path, &st) == -1) {
-        mkdir(down_path, 0755);
+        int fd = open(full_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+          printf("Error: open() failed for %s (errno %d)\n", full_path, errno);
+        } else {
+          job->file_handle = (u64)(fd + 1); // +1 so 0 means not open (fd 0 is valid)
+          printf("Receiving: %s\n", full_path);
+        }
       }
 
-      snprintf(full_path, sizeof(full_path), "%s/%s", down_path, fname);
+      if (job->file_handle != 0) {
+        int fd = (int)(job->file_handle - 1);
+        lseek(fd, (off_t)g_ctx.io_req_offset, SEEK_SET);
+        write(fd, g_ctx.io_data_ptr, g_ctx.io_req_len);
 
-      FILE *f = fopen(full_path, "r+b");
-      if (!f)
-        f = fopen(full_path, "wb");
-
-      if (f) {
-        fseeko(f, (off_t)g_ctx.io_req_offset, SEEK_SET);
-        fwrite(g_ctx.io_data_ptr, 1, g_ctx.io_req_len, f);
-        fclose(f);
-        if (g_ctx.debug_enabled)
-          printf("DEBUG: Wrote Chunks %llu to %s\n", g_ctx.io_req_offset,
-                 full_path);
-
-        // Trigger Next Request
+        // Notify state machine of completion
         state_event_t ev;
         ev.type = EVENT_CHUNK_WRITTEN;
-        ev.tcp.socket = (u64)g_ctx.io_req_job_id;
+        ev.tcp.socket = (u64)job->id;
         ev.tcp.success = true;
         state_update(&g_ctx, &ev, platform_get_time_ms());
 
-        // Recursively handle the resulting IO request (REQ Send)
-        handle_io_request(sock);
-
-      } else {
-        printf("Error: Write IO failed for %s\n", full_path);
+        // Close file on completion
+        if (job->state == JOB_STATE_COMPLETED && job->file_handle != 0) {
+          close((int)(job->file_handle - 1));
+          job->file_handle = 0;
+          printf("Transfer Complete! File saved.\n");
+        }
       }
     }
   }
 
-  else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+  if (g_ctx.io_req_type == IO_STREAM_FILE) {
+    // Streaming sender: read file in large chunks, segment into TCP packets
+    transfer_job_t *job = NULL;
+    for (int i = 0; i < JOBS_MAX; ++i) {
+      if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+        job = &g_ctx.jobs_active[i];
+        break;
+      }
+    }
+
+    if (job && job->tcp_socket != 0 &&
+        job->tcp_socket != (u64)PLATFORM_INVALID_SOCKET) {
+      // Open file once if not already open
+      if (job->file_handle == 0) {
+        int fd = open(job->filename, O_RDONLY);
+        if (fd < 0) {
+          printf("Error: Cannot open file for streaming: %s\n", job->filename);
+          job->state = JOB_STATE_FAILED;
+          g_ctx.io_req_type = IO_NONE;
+          return;
+        }
+        job->file_handle = (u64)(fd + 1); // +1 so 0 means not open
+      }
+
+      int fd = (int)(job->file_handle - 1);
+      PlatformSocket s = (PlatformSocket)job->tcp_socket;
+      u64 file_offset = g_ctx.io_req_offset;
+      u64 total_to_send = job->file_size - file_offset;
+      u64 total_sent = 0;
+      const u32 READ_SIZE = BUFFER_SIZE_LARGE; // 4MB reads
+      const u32 TCP_SEG_SIZE = 65536 - sizeof(packet_header_t) -
+                               sizeof(msg_data_t) - 128;
+
+      // Fixed upper bound: max iterations = file_size / READ_SIZE + 1
+      u32 max_outer = (u32)((total_to_send / READ_SIZE) + 2);
+      if (max_outer > 1048576) max_outer = 1048576; // 4TB safety cap
+
+      for (u32 outer = 0; outer < max_outer && total_sent < total_to_send;
+           ++outer) {
+        // Seek and read
+        lseek(fd, (off_t)(file_offset + total_sent), SEEK_SET);
+
+        u32 to_read = READ_SIZE;
+        u64 remain = total_to_send - total_sent;
+        if (remain < to_read) to_read = (u32)remain;
+
+        ssize_t bytes_read = read(fd, g_ctx.work_buffer, to_read);
+        if (bytes_read <= 0) break;
+
+        // Segment into TCP packets and send
+        u32 seg_offset = 0;
+        u32 max_inner = ((u32)bytes_read / TCP_SEG_SIZE) + 2;
+
+        for (u32 inner = 0; inner < max_inner && seg_offset < (u32)bytes_read;
+             ++inner) {
+          u32 chunk_len = (u32)bytes_read - seg_offset;
+          if (chunk_len > TCP_SEG_SIZE) chunk_len = TCP_SEG_SIZE;
+
+          packet_header_t header = {0};
+          header.magic = MAGIC_TOYS;
+          header.type = PACKET_TYPE_CHUNK_DATA;
+
+          msg_data_t data_msg = {0};
+          data_msg.offset = file_offset + total_sent + seg_offset;
+          data_msg.job_id = job->id;
+
+          header.body_length = sizeof(msg_data_t) + chunk_len;
+
+          u8 *ptr = g_ctx.outbox;
+          memcpy(ptr, &header, sizeof(packet_header_t));
+          memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+          memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t),
+                 g_ctx.work_buffer + seg_offset, chunk_len);
+
+          u32 packet_len =
+              (u32)(sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len);
+
+          int res = platform_tcp_send(s, ptr, packet_len);
+          if (res < 0) {
+            printf("Error: TCP Stream Send Failed. Closing.\n");
+            job->state = JOB_STATE_FAILED;
+            goto posix_stream_done;
+          }
+
+          seg_offset += chunk_len;
+        }
+
+        total_sent += (u64)bytes_read;
+
+        // Progress (every 64MB)
+        if ((total_sent % (64 * 1024 * 1024)) < READ_SIZE) {
+          printf("Streaming: %llu / %llu MB (%.1f%%)\n",
+                 (unsigned long long)(total_sent / (1024 * 1024)),
+                 (unsigned long long)(total_to_send / (1024 * 1024)),
+                 (double)total_sent * 100.0 / (double)total_to_send);
+        }
+      }
+
+      posix_stream_done:
+      // Close file handle
+      close(fd);
+      job->file_handle = 0;
+      job->is_streaming = 0;
+
+      if (total_sent >= total_to_send) {
+        printf("Stream Complete: sent %llu bytes\n",
+               (unsigned long long)total_sent);
+      }
+    }
+  } else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
     char ip_str[64];
     struct in_addr addr;
     addr.s_addr = g_ctx.io_peer_ip;
@@ -717,6 +836,12 @@ int main(int argc, char **argv) {
               if (client >= 0) {
                 int flags = fcntl(client, F_GETFL, 0);
                 fcntl(client, F_SETFL, flags | O_NONBLOCK);
+
+                // Disable Nagle
+                {
+                  int opt = 1;
+                  setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+                }
 
                 char client_ip[64];
                 inet_ntop(AF_INET, &client_addr.sin_addr, client_ip,
