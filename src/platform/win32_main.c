@@ -1,0 +1,1036 @@
+#ifdef _WIN32
+
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
+#include <windows.h>
+#include <process.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <assert.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+
+#include "../core/types.h"
+
+
+#define TIGER_ASSERT(cond) if (!(cond)) { fprintf(stderr, "ASSERT FAILED: %s:%d\n", __FILE__, __LINE__); abort(); }
+
+// Types
+typedef uint64_t PlatformSocket;
+#define PLATFORM_INVALID_SOCKET ((PlatformSocket)(~0))
+
+typedef uintptr_t PlatformFile;
+#define PLATFORM_INVALID_FILE ((PlatformFile)(~0))
+
+typedef struct {
+#ifdef _MSC_VER
+    __declspec(align(8)) uint8_t data[64];
+#else
+    _Alignas(8) uint8_t data[64];
+#endif
+} PlatformMutex;
+
+typedef struct {
+#ifdef _MSC_VER
+    __declspec(align(8)) uint8_t data[32];
+#else
+    _Alignas(8) uint8_t data[32];
+#endif
+} PlatformThread;
+
+
+// --- Implementation ---
+int platform_init(void) {
+    WSADATA wsaData;
+    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (iResult != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+uint64_t platform_get_time_ms(void) {
+    return GetTickCount64();
+}
+
+// Networking
+PlatformSocket platform_udp_bind(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
+        return PLATFORM_INVALID_SOCKET;
+    }
+
+    struct sockaddr_in local;
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = INADDR_ANY;
+    local.sin_port = htons(port);
+
+    if (bind(s, (SOCKADDR*)&local, sizeof(local)) == SOCKET_ERROR) {
+        closesocket(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+
+    return (PlatformSocket)s;
+}
+
+int platform_udp_enable_broadcast(PlatformSocket sock) {
+    SOCKET s = (SOCKET)sock;
+    BOOL bOptVal = TRUE;
+    int bOptLen = sizeof(BOOL);
+    if (setsockopt(s, SOL_SOCKET, SO_BROADCAST, (char*)&bOptVal, bOptLen) == SOCKET_ERROR) {
+        return -1;
+    }
+    return 0;
+}
+
+int platform_udp_sendto(PlatformSocket sock, const void *data, size_t len, const char *ip, uint16_t port) {
+    SOCKET s = (SOCKET)sock;
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    inet_pton(AF_INET, ip, &dest.sin_addr);
+    dest.sin_port = htons(port);
+
+    int sent = sendto(s, (const char*)data, (int)len, 0, (SOCKADDR*)&dest, sizeof(dest));
+    if (sent == SOCKET_ERROR) {
+        return -1;
+    }
+    return sent;
+}
+
+int platform_udp_recvfrom(PlatformSocket sock, void *buf, size_t len, char *ip_out, size_t ip_len, uint16_t *port_out) {
+    SOCKET s = (SOCKET)sock;
+    struct sockaddr_in sender;
+    int senderLen = sizeof(sender);
+
+    int received = recvfrom(s, (char*)buf, (int)len, 0, (SOCKADDR*)&sender, &senderLen);
+    if (received == SOCKET_ERROR) {
+        return -1;
+    }
+
+    if (ip_out && ip_len > 0) {
+        inet_ntop(AF_INET, &sender.sin_addr, ip_out, ip_len);
+    }
+    if (port_out) {
+        *port_out = ntohs(sender.sin_port);
+    }
+
+    return received;
+}
+
+// TCP Helpers
+PlatformSocket platform_tcp_bind(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return PLATFORM_INVALID_SOCKET;
+    
+    struct sockaddr_in local;
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = INADDR_ANY;
+    local.sin_port = htons(port);
+    
+    if (bind(s, (SOCKADDR*)&local, sizeof(local)) == SOCKET_ERROR) {
+        closesocket(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    
+    if (listen(s, SOMAXCONN) == SOCKET_ERROR) {
+        closesocket(s);
+        return PLATFORM_INVALID_SOCKET;
+    }
+    
+    // Set Non-Blocking?
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+    
+    return (PlatformSocket)s;
+}
+
+PlatformSocket platform_tcp_connect(const char* ip, uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return PLATFORM_INVALID_SOCKET;
+    
+    // Set Non-Blocking
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+    
+    // Disable Nagle for low latency control messages
+    {
+        BOOL opt = TRUE;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
+    }
+    
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    inet_pton(AF_INET, ip, &dest.sin_addr);
+    dest.sin_port = htons(port);
+    
+    int res = connect(s, (SOCKADDR*)&dest, sizeof(dest));
+    if (res == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            printf("DEBUG: connect failed with error %d\n", err);
+            closesocket(s);
+            return PLATFORM_INVALID_SOCKET;
+        }
+    }
+    
+    return (PlatformSocket)s;
+}
+
+int platform_tcp_send(PlatformSocket sock, const void* data, size_t len) {
+    SOCKET s = (SOCKET)sock;
+    const char* ptr = (const char*)data;
+    size_t remaining = len;
+    
+    while (remaining > 0) {
+        int sent = send(s, ptr, (int)remaining, 0);
+        if (sent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                // Buffer full, wait a bit
+                Sleep(1); 
+                continue;
+            }
+            printf("Error: send() failed WSA=%d\n", err);
+            return -1;
+        }
+        if (sent == 0) return -1; // Connection closed?
+        
+        ptr += sent;
+        remaining -= sent;
+    }
+    return (int)len;
+}
+
+int platform_tcp_recv(PlatformSocket sock, void* buf, size_t len) {
+    SOCKET s = (SOCKET)sock;
+    int received = recv(s, (char*)buf, (int)len, 0);
+    if (received == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return 0;
+        return -1;
+    }
+    return received;
+}
+
+static void platform_tcp_set_nodelay(PlatformSocket sock) {
+    SOCKET s = (SOCKET)sock;
+    BOOL opt = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
+}
+
+void platform_close_socket(PlatformSocket sock) {
+    closesocket((SOCKET)sock);
+}
+
+// Threading
+
+typedef struct {
+    HANDLE handle;
+    void (*func)(void*);
+    void *arg;
+} Win32Thread;
+
+static unsigned __stdcall thread_wrapper(void *arg) {
+    Win32Thread *pt = (Win32Thread*)arg;
+    if (pt->func) {
+        pt->func(pt->arg);
+    }
+    return 0;
+}
+
+void platform_thread_start(PlatformThread *thread, void (*func)(void*), void *arg) {
+    Win32Thread *pt = (Win32Thread*)thread->data;
+    pt->func = func;
+    pt->arg = arg;
+    uintptr_t handle = _beginthreadex(NULL, 0, thread_wrapper, pt, 0, NULL);
+    if (handle == 0) {
+        pt->handle = NULL;
+        return;
+    }
+    pt->handle = (HANDLE)handle;
+}
+
+void platform_thread_join(PlatformThread *thread) {
+    Win32Thread *pt = (Win32Thread*)thread->data;
+    if (pt->handle) {
+        WaitForSingleObject(pt->handle, INFINITE);
+        CloseHandle(pt->handle);
+        pt->handle = NULL;
+    }
+}
+
+// --- Main ---
+
+// Global Context (Statically allocated)
+static ctx_main_t g_ctx;
+
+// Network Buffers (Statically allocated)
+static u8 g_net_rx_buffer[65536]; // Max UDP packet size
+
+// TCP Stream Reassembly Buffers
+// 16 Jobs * 66KB (64KB chunks + Header overhead) = ~1MB
+typedef struct {
+    u8 buffer[BUFFER_SIZE_LARGE + 131072]; // 4MB + 128KB headroom
+    u32 len;
+} JobRxBuffer;
+
+static JobRxBuffer g_job_rx[JOBS_MAX];
+
+// Helper to get Downloads path (Simple version using env var)
+static void get_downloads_path(char* out_buf, size_t size) {
+    const char* user_profile = getenv("USERPROFILE");
+    if (user_profile) {
+        snprintf(out_buf, size, "%s\\Downloads", user_profile);
+    } else {
+        strncpy(out_buf, ".", size);
+    }
+}
+
+// Handle IO Requests from State Machine
+static void handle_io_request(PlatformSocket sock) {
+    if (g_ctx.io_req_type == IO_NONE) return;
+
+    if (g_ctx.io_req_type == IO_READ_CHUNK) {
+        // Find filename and Job
+        char* fname = NULL;
+        transfer_job_t* job = NULL;
+
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].state != JOB_STATE_FREE && 
+                 g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) { 
+                 fname = g_ctx.jobs_active[i].filename;
+                 job = &g_ctx.jobs_active[i];
+                 break;
+             }
+        }
+        
+        // Fallback for MVP
+        if (!fname) {
+             for (int i = 0; i < JOBS_MAX; ++i) {
+                 if (g_ctx.jobs_active[i].state == JOB_STATE_OFFER_SENT || 
+                     g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING) {
+                     fname = g_ctx.jobs_active[i].filename;
+                     job = &g_ctx.jobs_active[i];
+                     if (g_ctx.debug_enabled) printf("DEBUG: IO Read Fallback to Job %d File '%s'\n", i, fname);
+                     break;
+                 }
+             }
+        }
+
+        if (fname) {
+            FILE* f = fopen(fname, "rb");
+            if (f) {
+                _fseeki64(f, (long long)g_ctx.io_req_offset, SEEK_SET);
+                
+                size_t read_len = g_ctx.io_req_len;
+                if (read_len > sizeof(g_ctx.work_buffer)) read_len = sizeof(g_ctx.work_buffer);
+                
+                size_t read = fread(g_ctx.work_buffer, 1, read_len, f);
+                fclose(f);
+                
+                if (read > 0) {
+                    if (job && job->tcp_socket != 0 && job->tcp_socket != PLATFORM_INVALID_SOCKET) {
+                        // ** TCP Fast Path **
+                        // Segment into 64KB chunks to fit in our RX buffers
+                        const size_t TCP_CHUNK_SIZE = 65536 - sizeof(packet_header_t) - sizeof(msg_data_t) - 128; // Safe margin
+                        size_t offset = 0;
+                        PlatformSocket s = (PlatformSocket)job->tcp_socket;
+
+                        while (offset < read) {
+                            size_t chunk_len = read - offset;
+                            if (chunk_len > TCP_CHUNK_SIZE) chunk_len = TCP_CHUNK_SIZE;
+                            
+                            packet_header_t header = {0};
+                            header.magic = MAGIC_TOYS;
+                            header.type = PACKET_TYPE_CHUNK_DATA;
+                            
+                            msg_data_t data_msg = {0};
+                            data_msg.offset = g_ctx.io_req_offset + offset;
+                            data_msg.job_id = job->id; 
+                            
+                            header.body_length = sizeof(msg_data_t) + chunk_len;
+                            
+                            // Zero-Copy-ish: We have to construct packet.
+                            // We can use outbox or send multiple buffers (WSASend).
+                            // For now, copy to outbox is simple and fast enough for >100MB/s 
+                            // (memcpy is >10GB/s).
+                            u8* ptr = g_ctx.outbox;
+                            memcpy(ptr, &header, sizeof(packet_header_t));
+                            memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
+                                   g_ctx.work_buffer + offset, chunk_len);
+                                   
+                            size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
+                            
+                            int res = platform_tcp_send(s, ptr, packet_len);
+                            if (res < 0) {
+                                printf("Error: TCP Send Failed during chunk xfer. Closing.\n");
+                                // Handle Close?
+                                break;
+                            }
+                            
+                            offset += chunk_len;
+                            // NO SLEEP!
+                        }
+                        if (g_ctx.debug_enabled) printf("DEBUG: TCP Stream Sent %llu bytes\n", read);
+
+                    }
+                }
+            } else {
+                printf("Error: Read IO failed for '%s'\n", fname);
+            }
+        } else {
+             if (g_ctx.debug_enabled) printf("DEBUG: IO Read - No Active Job Found for ID %d\n", g_ctx.io_req_job_id);
+        }
+    } 
+    else if (g_ctx.io_req_type == IO_WRITE_CHUNK) {
+        // Find receiver job
+        transfer_job_t* job = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].state == JOB_STATE_TRANSFERRING &&
+                 g_ctx.jobs_active[i].file_size > 0) {
+                 job = &g_ctx.jobs_active[i];
+                 break;
+             }
+        }
+        
+        if (job) {
+            // Open file handle once (persistent across chunks)
+            if (job->file_handle == 0) {
+                char full_path[512];
+                char down_path[256];
+                get_downloads_path(down_path, sizeof(down_path));
+                CreateDirectoryA(down_path, NULL);
+                snprintf(full_path, sizeof(full_path), "%s\\%s", down_path, job->filename);
+                
+                HANDLE hf = CreateFileA(full_path, GENERIC_WRITE, 0, NULL,
+                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                if (hf == INVALID_HANDLE_VALUE) {
+                    printf("Error: CreateFile failed for %s (err %lu)\n", full_path, GetLastError());
+                } else {
+                    job->file_handle = (u64)hf;
+                    printf("Receiving: %s\n", full_path);
+                }
+            }
+            
+            if (job->file_handle != 0) {
+                HANDLE hf = (HANDLE)job->file_handle;
+                LARGE_INTEGER li;
+                li.QuadPart = (LONGLONG)g_ctx.io_req_offset;
+                SetFilePointerEx(hf, li, NULL, FILE_BEGIN);
+                
+                DWORD written = 0;
+                WriteFile(hf, g_ctx.io_data_ptr, g_ctx.io_req_len, &written, NULL);
+                
+                // Notify state machine of completion
+                state_event_t ev;
+                ev.type = EVENT_CHUNK_WRITTEN;
+                ev.tcp.socket = (u64)job->id;
+                ev.tcp.success = true;
+                state_update(&g_ctx, &ev, platform_get_time_ms());
+                
+                // Close file on completion
+                if (job->state == JOB_STATE_COMPLETED && job->file_handle != 0) {
+                    CloseHandle((HANDLE)job->file_handle);
+                    job->file_handle = 0;
+                    printf("Transfer Complete! File saved.\n");
+                }
+            }
+        }
+    }
+
+
+    if (g_ctx.io_req_type == IO_STREAM_FILE) {
+        // Streaming sender: read file in large chunks, segment into TCP packets
+        transfer_job_t* job = NULL;
+        for (int i = 0; i < JOBS_MAX; ++i) {
+            if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                job = &g_ctx.jobs_active[i];
+                break;
+            }
+        }
+        
+        if (job && job->tcp_socket != 0 && job->tcp_socket != PLATFORM_INVALID_SOCKET) {
+            // Open file once if not already open
+            if (job->file_handle == 0) {
+                HANDLE hf = CreateFileA(job->filename, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                if (hf == INVALID_HANDLE_VALUE) {
+                    printf("Error: Cannot open file for streaming: %s\n", job->filename);
+                    job->state = JOB_STATE_FAILED;
+                    g_ctx.io_req_type = IO_NONE;
+                    return;
+                }
+                job->file_handle = (u64)hf;
+            }
+            
+            HANDLE hf = (HANDLE)job->file_handle;
+            PlatformSocket s = (PlatformSocket)job->tcp_socket;
+            u64 file_offset = g_ctx.io_req_offset;
+            u64 total_to_send = job->file_size - file_offset;
+            u64 total_sent = 0;
+            const u32 READ_SIZE = BUFFER_SIZE_LARGE; // 4MB reads
+            const u32 TCP_SEG_SIZE = 65536 - sizeof(packet_header_t) - sizeof(msg_data_t) - 128;
+            
+            // Fixed upper bound: max iterations = file_size / READ_SIZE + 1
+            u32 max_outer = (u32)((total_to_send / READ_SIZE) + 2);
+            if (max_outer > 1048576) max_outer = 1048576; // 4TB safety cap
+            
+            for (u32 outer = 0; outer < max_outer && total_sent < total_to_send; ++outer) {
+                // Seek and read
+                LARGE_INTEGER li;
+                li.QuadPart = (LONGLONG)(file_offset + total_sent);
+                SetFilePointerEx(hf, li, NULL, FILE_BEGIN);
+                
+                DWORD to_read = READ_SIZE;
+                u64 remain = total_to_send - total_sent;
+                if (remain < to_read) to_read = (DWORD)remain;
+                
+                DWORD bytes_read = 0;
+                BOOL ok = ReadFile(hf, g_ctx.work_buffer, to_read, &bytes_read, NULL);
+                if (!ok || bytes_read == 0) {
+                    if (!ok) printf("Error: ReadFile failed (err %lu)\n", GetLastError());
+                    break;
+                }
+                if (outer == 0) printf("Streaming: first read %lu bytes, total_to_send=%llu\n", bytes_read, total_to_send);
+                
+                // Segment into TCP packets and send
+                u32 seg_offset = 0;
+                u32 max_inner = (bytes_read / TCP_SEG_SIZE) + 2;
+                
+                for (u32 inner = 0; inner < max_inner && seg_offset < bytes_read; ++inner) {
+                    u32 chunk_len = bytes_read - seg_offset;
+                    if (chunk_len > TCP_SEG_SIZE) chunk_len = TCP_SEG_SIZE;
+                    
+                    packet_header_t header = {0};
+                    header.magic = MAGIC_TOYS;
+                    header.type = PACKET_TYPE_CHUNK_DATA;
+                    
+                    msg_data_t data_msg = {0};
+                    data_msg.offset = file_offset + total_sent + seg_offset;
+                    data_msg.job_id = job->id;
+                    
+                    header.body_length = sizeof(msg_data_t) + chunk_len;
+                    
+                    u8* ptr = g_ctx.outbox;
+                    memcpy(ptr, &header, sizeof(packet_header_t));
+                    memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
+                    memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t),
+                           g_ctx.work_buffer + seg_offset, chunk_len);
+                    
+                    u32 packet_len = (u32)(sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len);
+                    
+                    int res = platform_tcp_send(s, ptr, packet_len);
+                    if (res < 0) {
+                        printf("Error: TCP Stream Send Failed (pkt=%u, seg=%u/%u, iter=%u). Closing.\n",
+                               packet_len, inner, max_inner, outer);
+                        job->state = JOB_STATE_FAILED;
+                        goto stream_done;
+                    }
+                    
+                    seg_offset += chunk_len;
+                }
+                
+                total_sent += bytes_read;
+                
+                // Progress (every 64MB)
+                if ((total_sent % (64 * 1024 * 1024)) < READ_SIZE) {
+                    printf("Streaming: %llu / %llu MB (%.1f%%)\n",
+                           total_sent / (1024*1024), total_to_send / (1024*1024),
+                           (double)total_sent * 100.0 / (double)total_to_send);
+                }
+            }
+            
+            stream_done:
+            // Close file handle
+            CloseHandle(hf);
+            job->file_handle = 0;
+            job->is_streaming = 0;
+            
+            if (total_sent >= total_to_send) {
+                printf("Stream Complete: sent %llu bytes\n", total_sent);
+            }
+        }
+    } else if (g_ctx.io_req_type == IO_TCP_CONNECT) {
+        char ip_str[64];
+        struct in_addr addr;
+        addr.s_addr = g_ctx.io_peer_ip;
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+        
+        PlatformSocket sock = platform_tcp_connect(ip_str, g_ctx.io_peer_port);
+        if (sock != PLATFORM_INVALID_SOCKET) {
+             // We need to update the job with the socket?
+             // Or we wait for EVENT_TCP_CONNECTED?
+             // Since it's non-blocking, we don't know if it's connected yet.
+             // We should store the socket in the job immediately so we can poll it.
+             // But handle_io_request doesn't return anything to state.
+             // We can update g_ctx directly.
+             // Only state.c logic calling this knows which job it is (io_req_job_id).
+             
+             // Update Job Directly (Platform Privilege)
+             for (int i=0; i<JOBS_MAX; ++i) {
+                 if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                     g_ctx.jobs_active[i].tcp_socket = sock;
+                     break;
+                 }
+             }
+        } else {
+             printf("Error: TCP Connect failed to %s\n", ip_str);
+             // Signal failure?
+             state_event_t ev;
+             ev.type = EVENT_TCP_CONNECTED;
+             ev.tcp.socket = 0;
+             ev.tcp.success = false;
+             state_update(&g_ctx, &ev, platform_get_time_ms());
+        }
+    } else if (g_ctx.io_req_type == IO_TCP_SEND) {
+        // Find Job / Socket
+        PlatformSocket sock = PLATFORM_INVALID_SOCKET;
+         for (int i=0; i<JOBS_MAX; ++i) {
+             if (g_ctx.jobs_active[i].id == g_ctx.io_req_job_id) {
+                 sock = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+                 break;
+             }
+         }
+         
+         if (sock != PLATFORM_INVALID_SOCKET) {
+             // Send Data
+             // io_data_ptr points to buffer
+             int result = platform_tcp_send(sock, g_ctx.io_data_ptr, g_ctx.io_req_len);
+             if (result < 0) {
+                 printf("Error: TCP Send Failed\n");
+                 // Close?
+             } else {
+                 if (g_ctx.debug_enabled) printf("DEBUG: TCP Sent %d bytes\n", result);
+             }
+         }
+    } else if (g_ctx.io_req_type == IO_TCP_CLOSE) {
+         // ...
+    }
+
+    g_ctx.io_req_type = IO_NONE; // Clear
+}
+
+int main(void) {
+    printf("[Sendtoy] Starting...\n");
+
+    // 1. Platform Init
+    if (platform_init() != 0) {
+        fprintf(stderr, "Failed to init platform\n");
+        return 1;
+    }
+
+    // 2. Core Init
+    state_init(&g_ctx);
+    
+    // Init Random Identity (Temporary until Crypto)
+    srand((unsigned int)(time(NULL) ^ GetCurrentProcessId()));
+    for (int i = 0; i < 32; ++i) {
+        g_ctx.my_public_key[i] = (u8)rand();
+    }
+    
+    // Configuration Defaults
+    g_ctx.config_listen_port = 44444;
+    g_ctx.config_target_port = 44444;
+
+    // 3. Network Setup (Discovery)
+    PlatformSocket udp_sock = platform_udp_bind(g_ctx.config_listen_port); 
+    if (udp_sock == PLATFORM_INVALID_SOCKET) {
+        fprintf(stderr, "Failed to bind UDP socket on port %d\n", g_ctx.config_listen_port);
+        return 1;
+    }
+    
+    if (platform_udp_enable_broadcast(udp_sock) != 0) {
+        fprintf(stderr, "Failed to enable broadcast\n");
+    }
+
+    printf("[Sendtoy] Listening on port %d...\n", g_ctx.config_listen_port);
+
+    printf("[Sendtoy] Listening on port %d...\n", g_ctx.config_listen_port);
+
+    // 3b. TCP Listener
+    PlatformSocket tcp_listener = platform_tcp_bind(g_ctx.config_listen_port);
+    if (tcp_listener == PLATFORM_INVALID_SOCKET) {
+        fprintf(stderr, "Failed to bind TCP listener on port %d\n", g_ctx.config_listen_port);
+        // Continue anyway? UDP might work.
+    } else {
+        printf("[Sendtoy] TCP Listening on port %d...\n", g_ctx.config_listen_port);
+    }
+
+    // Command Line Args: Target IP
+    const char* target_ip = "255.255.255.255";
+    if (__argc > 1) {
+        target_ip = __argv[1];
+        printf("[Sendtoy] Targeting Peer IP: %s\n", target_ip);
+    }
+
+    // 4. Main Loop
+    u64 last_tick = platform_get_time_ms();
+    
+    // Console Input Buffer
+    char input_buf[256];
+    int input_pos = 0;
+
+    // Set Console Mode for non-blocking check?
+    // We'll use polling with kbhit-style logic or PeekConsoleInput
+    HANDLE hStdIn = GetStdHandle(STD_INPUT_HANDLE);
+
+    while (1) {
+        u64 now = platform_get_time_ms();
+
+        // 4a. Console Input (Simple Poll)
+        DWORD events = 0;
+        GetNumberOfConsoleInputEvents(hStdIn, &events);
+        if (events > 0) {
+            INPUT_RECORD record;
+            DWORD read;
+            if (PeekConsoleInputA(hStdIn, &record, 1, &read) && read > 0) {
+                if (record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown) {
+                    ReadConsoleInputA(hStdIn, &record, 1, &read); // Consume
+                    char c = record.Event.KeyEvent.uChar.AsciiChar;
+                    if (c == '\r' || c == '\n') {
+                        if (input_pos > 0) {
+                            input_buf[input_pos] = 0;
+                            printf("\nCMD: %s\n", input_buf);
+                            
+                            // Parse "send <IP> <File>" manually to handle quotes/spaces
+                            char cmd[16] = {0};
+                            char ip_str[64] = {0};
+                            char fname[256] = {0};
+                            
+                            char* s = input_buf;
+                            
+                            // 1. Skip leading whitespace
+                            while (*s && *s <= 32) s++;
+                            
+                            // 2. Parse Command
+                            int i = 0;
+                            while (*s && *s > 32 && i < 15) cmd[i++] = *s++;
+                            cmd[i] = 0;
+                            
+                            // 3. Skip whitespace
+                            while (*s && *s <= 32) s++;
+                            
+                            // 4. Parse IP
+                            i = 0;
+                            while (*s && *s > 32 && i < 63) ip_str[i++] = *s++;
+                            ip_str[i] = 0;
+                            
+                            // 5. Skip whitespace
+                            while (*s && *s <= 32) s++;
+                            
+                            // 6. Parse Filename (Handle Quotes)
+                            if (*s == '\"') {
+                                s++; // Skip open quote
+                                i = 0;
+                                while (*s && *s != '\"' && i < 255) fname[i++] = *s++;
+                                if (*s == '\"') s++; // Skip close quote
+                            } else {
+                                i = 0;
+                                while (*s && *s >= 32 && i < 255) fname[i++] = *s++; // Take rest of line
+                                // Trim trailing whitespace?
+                                while (i > 0 && fname[i-1] <= 32) i--;
+                            }
+                            fname[i] = 0;
+
+                            if (cmd[0]) {
+                                if (strcmp(cmd, "send") == 0) {
+                                    if (ip_str[0] && fname[0]) {
+                                        state_event_t ev;
+                                        ev.type = EVENT_USER_COMMAND;
+                                        
+                                        struct in_addr addr;
+                                        if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                                            ev.cmd_send.target_ip = addr.s_addr;
+                                            
+                                            // Get File Size/Hash (Platform Job)
+                                            FILE* f = fopen(fname, "rb");
+                                            if (f) {
+                                                fseek(f, 0, SEEK_END);
+                                                ev.cmd_send.file_size = _ftelli64(f);
+                                                fclose(f);
+                                                strncpy(ev.cmd_send.filename, fname, 255);
+                                                ev.cmd_send.file_hash_low = 0xCAFEBABE; // Todo: Real Hash
+                                                
+                                                state_update(&g_ctx, &ev, platform_get_time_ms());
+                                            } else {
+                                                printf("Error: File not found: %s\n", fname);
+                                            }
+                                        } else {
+                                            printf("Error: Invalid IP\n");
+                                        }
+                                    } else {
+                                        printf("Usage: send <IP> <File>\n");
+                                    }
+                                } else if (strcmp(cmd, "debug") == 0) {
+                                    if (strcmp(ip_str, "on") == 0 || strcmp(ip_str, "1") == 0) {
+                                        g_ctx.debug_enabled = true;
+                                        printf("Debug Mode: ON\n");
+                                    } else if (strcmp(ip_str, "off") == 0 || strcmp(ip_str, "0") == 0) {
+                                        g_ctx.debug_enabled = false;
+                                        printf("Debug Mode: OFF\n");
+                                    } else {
+                                        printf("Usage: debug <on|off>\n");
+                                    }
+                                }
+                            }
+                            input_pos = 0;
+                        }
+                        printf("> ");
+                    } else if (c >= 32 && c <= 126 && input_pos < sizeof(input_buf) - 1) {
+                        input_buf[input_pos++] = c;
+                        printf("%c", c);
+                    } else if (c == 8 && input_pos > 0) { // Backspace
+                        input_pos--;
+                        printf("\b \b");
+                    }
+                } else {
+                     // Consume non-key events or key-up
+                     ReadConsoleInputA(hStdIn, &record, 1, &read);
+                }
+            }
+        }
+
+// Handle IO Requests from State Machine
+        // 4a. Tick Event
+        if (now - last_tick >= 100) {
+            state_event_t tick_ev;
+            tick_ev.type = EVENT_TICK_100MS;
+            state_update(&g_ctx, &tick_ev, now);
+            handle_io_request(udp_sock); // Handle IO
+            last_tick = now;
+            
+            // TigerStyle Output: Flush Outbox (Discovery packets)
+            if (g_ctx.outbox_len > 0) {
+                 char ip_str[64] = "255.255.255.255";
+                 u16 target_port = g_ctx.config_target_port;
+                 
+                 if (g_ctx.outbox_target_ip != 0) {
+                      struct in_addr addr;
+                      addr.s_addr = g_ctx.outbox_target_ip;
+                      if (inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str))) {
+                          // Success
+                      }
+                      target_port = g_ctx.outbox_target_port;
+                 } else {
+                      // Broadcast (Default) for 0
+                      target_port = g_ctx.config_target_port; 
+                      if (g_ctx.outbox_target_port != 0) target_port = g_ctx.outbox_target_port;
+                 }
+
+                 if (g_ctx.debug_enabled) printf("DEBUG: Sending %u bytes to %s:%u\n", g_ctx.outbox_len, ip_str, target_port);
+                 platform_udp_sendto(udp_sock, g_ctx.outbox, g_ctx.outbox_len, ip_str, target_port);
+                 g_ctx.outbox_len = 0;
+                 g_ctx.outbox_target_ip = 0; // Reset
+                 g_ctx.outbox_target_port = 0;
+            }
+        }
+
+        // 4b. Network Poll
+        fd_set readfds;
+        fd_set writefds;
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+        
+        FD_SET((SOCKET)udp_sock, &readfds);
+        if (tcp_listener != PLATFORM_INVALID_SOCKET) {
+            FD_SET((SOCKET)tcp_listener, &readfds);
+        }
+        
+        // Add Active TCP Sockets
+        for (int i=0; i<JOBS_MAX; ++i) {
+            if (g_ctx.jobs_active[i].tcp_socket != 0 && g_ctx.jobs_active[i].tcp_socket != PLATFORM_INVALID_SOCKET) {
+                FD_SET((SOCKET)g_ctx.jobs_active[i].tcp_socket, &readfds);
+                if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+                    FD_SET((SOCKET)g_ctx.jobs_active[i].tcp_socket, &writefds);
+                }
+            }
+        }
+
+        struct timeval tv = { 0, 10000 }; // 10ms timeout
+
+        int activity = select(0, &readfds, &writefds, NULL, &tv);
+
+        if (activity == SOCKET_ERROR) {
+            printf("DEBUG: select failed with error %d\n", WSAGetLastError());
+        }
+
+        if (activity > 0) {
+            // UDP
+            if (FD_ISSET((SOCKET)udp_sock, &readfds)) {
+                char ip_str[64];
+                u16 port;
+                int bytes = platform_udp_recvfrom(udp_sock, g_net_rx_buffer, sizeof(g_net_rx_buffer), ip_str, sizeof(ip_str), &port);
+                
+                if (bytes > 0) {
+                    if (g_ctx.debug_enabled) printf("DEBUG: UDP Recv %d bytes from %s:%d\n", bytes, ip_str, port);
+                    state_event_t net_ev;
+                    net_ev.type = EVENT_NET_PACKET_RECEIVED;
+                    net_ev.packet.data = g_net_rx_buffer;
+                    net_ev.packet.len = (u32)bytes;
+                    net_ev.packet.from_port = port;
+                    
+                    struct in_addr addr;
+                    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+                        net_ev.packet.from_ip = addr.s_addr;
+                    } else {
+                        net_ev.packet.from_ip = 0;
+                    }
+
+                    state_update(&g_ctx, &net_ev, platform_get_time_ms());
+                    handle_io_request(udp_sock);
+                }
+            }
+            
+            // TCP Listener (Accept)
+            if (tcp_listener != PLATFORM_INVALID_SOCKET && FD_ISSET((SOCKET)tcp_listener, &readfds)) {
+                SOCKADDR_IN client_addr;
+                int addrlen = sizeof(client_addr);
+                SOCKET client = accept((SOCKET)tcp_listener, (SOCKADDR*)&client_addr, &addrlen);
+                if (client != INVALID_SOCKET) {
+                    u_long mode = 1;
+                    ioctlsocket(client, FIONBIO, &mode);
+                    
+                    // Disable Nagle
+                    {
+                        BOOL opt = TRUE;
+                        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
+                    }
+                    
+                    char client_ip[64];
+                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+                    printf("DEBUG: Accepted TCP Connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
+                    
+                    state_event_t ev;
+                    ev.type = EVENT_TCP_CONNECTED;
+                    ev.tcp.socket = (u64)client;
+                    ev.tcp.success = true;
+                    
+                    state_update(&g_ctx, &ev, platform_get_time_ms());
+                    handle_io_request(udp_sock);
+                } else {
+                    printf("DEBUG: accept failed with error %d\n", WSAGetLastError());
+                }
+            }
+            
+            // TCP Sockets (Data / Connect Completion)
+            for (int i=0; i<JOBS_MAX; ++i) {
+                PlatformSocket s = (PlatformSocket)g_ctx.jobs_active[i].tcp_socket;
+                if (s != 0 && s != PLATFORM_INVALID_SOCKET) {
+                     // Check Write (Connect Completion)
+                     if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING && FD_ISSET((SOCKET)s, &writefds)) {
+                         // Check for success or error
+                         int err = 0;
+                         int len = sizeof(err);
+                         getsockopt((SOCKET)s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+                         
+                         if (err == 0) {
+                             if (g_ctx.debug_enabled) printf("DEBUG: TCP Socket %llu Connected!\n", s);
+                             state_event_t ev;
+                             ev.type = EVENT_TCP_CONNECTED;
+                             ev.tcp.socket = (u64)s;
+                             ev.tcp.success = true;
+                             state_update(&g_ctx, &ev, platform_get_time_ms());
+                             handle_io_request(udp_sock);
+                         } else {
+                             printf("DEBUG: TCP Connect Async Failed with error %d\n", err);
+                             state_event_t ev;
+                             ev.type = EVENT_TCP_CONNECTED;
+                             ev.tcp.socket = (u64)s;
+                             ev.tcp.success = false;
+                             state_update(&g_ctx, &ev, platform_get_time_ms());
+                             closesocket((SOCKET)s);
+                             g_ctx.jobs_active[i].tcp_socket = 0;
+                         }
+                         continue; // Don't process read this tick if we just connected
+                     }
+
+                     
+                     // Check Read (Data)
+                     if (FD_ISSET((SOCKET)s, &readfds)) {
+                         JobRxBuffer* rx = &g_job_rx[i];
+                         // Appending to existing buffer
+                         int space = sizeof(rx->buffer) - rx->len;
+                         if (space > 0) {
+                             int n = platform_tcp_recv(s, rx->buffer + rx->len, space);
+                             if (n > 0) {
+                                 rx->len += n;
+                                 
+                                 // Framing Loop: Process all complete packets
+                                 while (rx->len >= sizeof(packet_header_t)) {
+                                     packet_header_t* head = (packet_header_t*)rx->buffer;
+                                     if (head->magic != MAGIC_TOYS) {
+                                         printf("DEBUG: TCP Magic Mismatch! Closing.\n");
+                                         state_event_t ev;
+                                         ev.type = EVENT_TCP_CLOSED;
+                                         ev.tcp.socket = (u64)s;
+                                         state_update(&g_ctx, &ev, platform_get_time_ms());
+                                         closesocket((SOCKET)s);
+                                         g_ctx.jobs_active[i].tcp_socket = 0;
+                                         rx->len = 0;
+                                         break;
+                                     }
+                                     
+                                     u32 packet_len = sizeof(packet_header_t) + (u32)head->body_length;
+                                     if (rx->len >= packet_len) {
+                                         state_event_t ev;
+                                         ev.type = EVENT_TCP_DATA;
+                                         ev.tcp.socket = (u64)s;
+                                         ev.tcp.data = rx->buffer;
+                                         ev.tcp.len = packet_len;
+                                         state_update(&g_ctx, &ev, platform_get_time_ms());
+                                         handle_io_request(udp_sock);
+                                         
+                                         u32 remaining = rx->len - packet_len;
+                                         if (remaining > 0) {
+                                             memmove(rx->buffer, rx->buffer + packet_len, remaining);
+                                         }
+                                         rx->len = remaining;
+                                     } else {
+                                         break;
+                                     }
+                                 }
+                             } else if (n == 0) {
+                                 if (g_ctx.debug_enabled) printf("DEBUG: TCP Socket %llu Closed by Peer\n", s);
+                                 state_event_t ev;
+                                 ev.type = EVENT_TCP_CLOSED;
+                                 ev.tcp.socket = (u64)s;
+                                 state_update(&g_ctx, &ev, platform_get_time_ms());
+                                 closesocket((SOCKET)s);
+                                 g_ctx.jobs_active[i].tcp_socket = 0;
+                                 rx->len = 0; 
+                             } else {
+                                 state_event_t ev;
+                                 ev.type = EVENT_TCP_CLOSED;
+                                 ev.tcp.socket = (u64)s;
+                                 state_update(&g_ctx, &ev, platform_get_time_ms());
+                                 closesocket((SOCKET)s);
+                                 g_ctx.jobs_active[i].tcp_socket = 0;
+                                 rx->len = 0;
+                             }
+                         } else {
+                             printf("DEBUG: TCP RX Buffer Full for Job %d! Len %u\n", g_ctx.jobs_active[i].id, rx->len);
+                         }
+                     }
+                }
+            }
+        }
+        // Periodic Status Logic
+        if ((now / 2000) != (last_tick / 2000)) {
+            // Every 2 seconds
+             for (int i=0; i<JOBS_MAX; ++i) {
+                if (g_ctx.jobs_active[i].state == JOB_STATE_CONNECTING) {
+                    printf("DEBUG: Job %d still waiting for connection... (Sock %llu)\n", 
+                           g_ctx.jobs_active[i].id, g_ctx.jobs_active[i].tcp_socket);
+                }
+             }
+        }
+    }
+
+    return 0;
+}
+
+#endif // _WIN32
