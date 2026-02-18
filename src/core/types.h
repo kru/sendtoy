@@ -6,12 +6,12 @@
 #include <stdint.h>
 
 #ifdef _MSC_VER
-#define TIGER_ALIGN(n) __declspec(align(n))
+#define SENDTOY_ALIGN(n) __declspec(align(n))
 #else
-#define TIGER_ALIGN(n) __attribute__((aligned(n)))
+#define SENDTOY_ALIGN(n) __attribute__((aligned(n)))
 #endif
 
-// TigerStyle: Fixed types
+// Fixed types
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -21,7 +21,7 @@ typedef int16_t i16;
 typedef int32_t i32;
 typedef int64_t i64;
 
-// TigerStyle: Constants & Limits
+// Constants & Limits
 #define JOBS_MAX 16
 #define PEERS_MAX 64
 #define BUFFER_SIZE_LARGE (4 * 1024 * 1024) // 4MB
@@ -30,7 +30,7 @@ typedef int64_t i64;
   (64 * 1024)                 // 64k blocks -> 64GB max file (Protocol 1.0)
 #define MAGIC_TOYS 0x544F5953 // "TOYS"
 
-// TigerStyle: Helper Macros
+// Helper Macros
 #define PRECISE_ASSERT(cond) // _Static_assert(cond, #cond)
 
 // --- Wire Protocol Structs ---
@@ -46,7 +46,7 @@ typedef enum {
   PACKET_TYPE_ACK = 7
 } packet_type_e;
 
-typedef struct TIGER_ALIGN(8) packet_header {
+typedef struct SENDTOY_ALIGN(8) packet_header {
   u32 magic;       // 0x544F5953 "TOYS"
   u32 type;        // packet_type_e
   u64 body_length; // Length of following data
@@ -55,7 +55,7 @@ typedef struct TIGER_ALIGN(8) packet_header {
 
 PRECISE_ASSERT(sizeof(packet_header_t) == 24);
 
-typedef struct TIGER_ALIGN(8) peer_advert {
+typedef struct SENDTOY_ALIGN(8) peer_advert {
   u8 public_key[32]; // X25519
   u32 ip_address;    // Network byte order
   u16 port;          // Network byte order
@@ -64,7 +64,7 @@ typedef struct TIGER_ALIGN(8) peer_advert {
 
 PRECISE_ASSERT(sizeof(peer_advert_t) == 40); // 32 + 4 + 2 + 2
 
-typedef struct TIGER_ALIGN(8) msg_offer {
+typedef struct SENDTOY_ALIGN(8) msg_offer {
     u64 file_size;
     u64 file_hash_low; // First 64 bits of hash for verification
     u32 job_id;        // Sender's Job ID
@@ -74,13 +74,13 @@ typedef struct TIGER_ALIGN(8) msg_offer {
     u32 padding;    // Align to 8 bytes (Total 288)
 } msg_offer_t;
 
-typedef struct TIGER_ALIGN(8) msg_request {
+typedef struct SENDTOY_ALIGN(8) msg_request {
     u32 job_id; // Sender's Job ID
     u32 len;    
     u64 offset;
 } msg_request_t;
 
-typedef struct TIGER_ALIGN(8) msg_data {
+typedef struct SENDTOY_ALIGN(8) msg_data {
     u32 job_id;
     u64 offset;
     // Data follows immediately after struct in the packet body
@@ -102,7 +102,7 @@ typedef enum {
 // Bitmap for tracking blocks. 64k blocks / 64 bits per u64 = 1024 u64s.
 #define BITMAP_SIZE_U64 (FILE_MAX_BLOCKS / 64)
 
-typedef struct TIGER_ALIGN(64) transfer_job {
+typedef struct SENDTOY_ALIGN(64) transfer_job {
   u8 peer_key[32];
   u8 file_hash[32]; // BLAKE3
   u64 file_size;
@@ -137,10 +137,7 @@ typedef struct TIGER_ALIGN(64) transfer_job {
   u8 padding[32]; 
 } transfer_job_t;
 
-// PRECISE_ASSERT(sizeof(transfer_job_t) % 64 == 0);
-
-
-typedef struct TIGER_ALIGN(64) peer_entry {
+typedef struct SENDTOY_ALIGN(64) peer_entry {
   u8 public_key[32];
   u32 ip_address;
   u16 port;
@@ -162,7 +159,7 @@ typedef enum {
 
 // --- Global Context ---
 
-typedef struct TIGER_ALIGN(64) ctx_main {
+typedef struct SENDTOY_ALIGN(64) ctx_main {
   // Identity
   u8 my_public_key[32];
   u8 my_private_key[32];
@@ -187,7 +184,7 @@ typedef struct TIGER_ALIGN(64) ctx_main {
   peer_entry_t peers_known[PEERS_MAX];
   u32 peers_count;
   u32 _padding1;
-  u64 next_advert_time; // TigerStyle: Explicit timing state
+  u64 next_advert_time; // Explicit timing state
 
   // Output (Side Effects)
   // The state machine writes here, platform layer reads and sends.
@@ -202,7 +199,7 @@ typedef struct TIGER_ALIGN(64) ctx_main {
 
   // System Resources
   // Large buffer for batching IO or crypto work
-  TIGER_ALIGN(64) u8 work_buffer[BUFFER_SIZE_LARGE];
+  SENDTOY_ALIGN(64) u8 work_buffer[BUFFER_SIZE_LARGE];
 } ctx_main_t;
 
 // PRECISE_ASSERT(sizeof(ctx_main_t) % 64 == 0);

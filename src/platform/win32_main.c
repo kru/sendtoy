@@ -16,9 +16,7 @@
 
 #include "../core/types.h"
 
-// --- Platform Interface & Implementation (Merged) ---
 
-// TigerStyle: Assert macros
 #define TIGER_ASSERT(cond) if (!(cond)) { fprintf(stderr, "ASSERT FAILED: %s:%d\n", __FILE__, __LINE__); abort(); }
 
 // Types
@@ -46,7 +44,6 @@ typedef struct {
 
 
 // --- Implementation ---
-
 int platform_init(void) {
     WSADATA wsaData;
     int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -56,20 +53,11 @@ int platform_init(void) {
     return 0;
 }
 
-void platform_cleanup(void) {
-    WSACleanup();
-}
-
-void platform_sleep_ms(uint32_t ms) {
-    Sleep(ms);
-}
-
 uint64_t platform_get_time_ms(void) {
     return GetTickCount64();
 }
 
 // Networking
-
 PlatformSocket platform_udp_bind(uint16_t port) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
@@ -245,8 +233,6 @@ typedef struct {
     void *arg;
 } Win32Thread;
 
-// PRECISE_ASSERT(sizeof(Win32Thread) <= sizeof(PlatformThread));
-
 static unsigned __stdcall thread_wrapper(void *arg) {
     Win32Thread *pt = (Win32Thread*)arg;
     if (pt->func) {
@@ -284,7 +270,7 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[65536]; // Max UDP packet size
 
-// TigerStyle: TCP Stream Reassembly Buffers
+// TCP Stream Reassembly Buffers
 // 16 Jobs * 66KB (64KB chunks + Header overhead) = ~1MB
 typedef struct {
     u8 buffer[BUFFER_SIZE_LARGE + 131072]; // 4MB + 128KB headroom
@@ -303,7 +289,7 @@ static void get_downloads_path(char* out_buf, size_t size) {
     }
 }
 
-// TigerStyle: Handle IO Requests from State Machine
+// Handle IO Requests from State Machine
 static void handle_io_request(PlatformSocket sock) {
     if (g_ctx.io_req_type == IO_NONE) return;
 
@@ -391,51 +377,6 @@ static void handle_io_request(PlatformSocket sock) {
                         }
                         if (g_ctx.debug_enabled) printf("DEBUG: TCP Stream Sent %llu bytes\n", read);
 
-                    } else {
-                        // ** UDP Fallback Path **
-                        // Burst Send Loop
-                        // Split into MTU sized chunks (e.g. 1400 bytes payload)
-                        // ...
-                        const size_t CHUNK_MTU = 1400;
-                        size_t offset = 0;
-                        
-                        char ip_str[64];
-                        struct in_addr addr;
-                        addr.s_addr = g_ctx.io_peer_ip;
-                        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-                        
-                        while (offset < read) {
-                            size_t chunk_len = read - offset;
-                            if (chunk_len > CHUNK_MTU) chunk_len = CHUNK_MTU;
-                            
-                            packet_header_t header = {0};
-                            header.magic = MAGIC_TOYS;
-                            header.type = PACKET_TYPE_CHUNK_DATA;
-                            
-                            msg_data_t data_msg = {0};
-                            data_msg.offset = g_ctx.io_req_offset + offset;
-                            data_msg.job_id = 0; 
-                            
-                            header.body_length = sizeof(msg_data_t) + chunk_len;
-                            
-                            u8* ptr = g_ctx.outbox;
-                            memcpy(ptr, &header, sizeof(packet_header_t));
-                            memcpy(ptr + sizeof(packet_header_t), &data_msg, sizeof(msg_data_t));
-                            memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t), 
-                                   g_ctx.work_buffer + offset, chunk_len);
-                                   
-                            size_t packet_len = sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
-                            
-                            platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str, g_ctx.io_peer_port);
-                            
-                            offset += chunk_len;
-                            
-                            // Pacing: Sleep 1ms every 32 packets (~45KB)
-                            if ((offset / chunk_len) % 32 == 0) {
-                                Sleep(1); 
-                            }
-                        }
-                        if (g_ctx.debug_enabled) printf("DEBUG: UDP Burst Sent %llu bytes to %s\n", read, ip_str);
                     }
                 }
             } else {
@@ -500,7 +441,8 @@ static void handle_io_request(PlatformSocket sock) {
             }
         }
     }
-
+
+
     if (g_ctx.io_req_type == IO_STREAM_FILE) {
         // Streaming sender: read file in large chunks, segment into TCP packets
         transfer_job_t* job = NULL;
@@ -673,7 +615,7 @@ static void handle_io_request(PlatformSocket sock) {
 }
 
 int main(void) {
-    printf("[TigerStyle] SendToy Starting...\n");
+    printf("[Sendtoy] Starting...\n");
 
     // 1. Platform Init
     if (platform_init() != 0) {
@@ -684,7 +626,7 @@ int main(void) {
     // 2. Core Init
     state_init(&g_ctx);
     
-    // TigerStyle: Init Random Identity (Temporary until Crypto)
+    // Init Random Identity (Temporary until Crypto)
     srand((unsigned int)(time(NULL) ^ GetCurrentProcessId()));
     for (int i = 0; i < 32; ++i) {
         g_ctx.my_public_key[i] = (u8)rand();
@@ -705,9 +647,9 @@ int main(void) {
         fprintf(stderr, "Failed to enable broadcast\n");
     }
 
-    printf("[TigerStyle] Listening on port %d...\n", g_ctx.config_listen_port);
+    printf("[Sendtoy] Listening on port %d...\n", g_ctx.config_listen_port);
 
-    printf("[TigerStyle] Listening on port %d...\n", g_ctx.config_listen_port);
+    printf("[Sendtoy] Listening on port %d...\n", g_ctx.config_listen_port);
 
     // 3b. TCP Listener
     PlatformSocket tcp_listener = platform_tcp_bind(g_ctx.config_listen_port);
@@ -715,14 +657,14 @@ int main(void) {
         fprintf(stderr, "Failed to bind TCP listener on port %d\n", g_ctx.config_listen_port);
         // Continue anyway? UDP might work.
     } else {
-        printf("[TigerStyle] TCP Listening on port %d...\n", g_ctx.config_listen_port);
+        printf("[Sendtoy] TCP Listening on port %d...\n", g_ctx.config_listen_port);
     }
 
     // Command Line Args: Target IP
     const char* target_ip = "255.255.255.255";
     if (__argc > 1) {
         target_ip = __argv[1];
-        printf("[TigerStyle] Targeting Peer IP: %s\n", target_ip);
+        printf("[Sendtoy] Targeting Peer IP: %s\n", target_ip);
     }
 
     // 4. Main Loop
@@ -852,10 +794,7 @@ int main(void) {
             }
         }
 
-// TigerStyle: Handle IO Requests from State Machine
-
-
-// ... Main Loop ...
+// Handle IO Requests from State Machine
         // 4a. Tick Event
         if (now - last_tick >= 100) {
             state_event_t tick_ev;

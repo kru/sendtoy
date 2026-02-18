@@ -3,8 +3,6 @@
 #include <stdlib.h> // for rand
 #include <stdio.h> // Debug
 
-// ... (rest of file)
-
 static void handle_tick(ctx_main_t* ctx, u64 now) {
     // 3. Reliability Check (Retransmission)
     // Iterate active jobs (Receivers)
@@ -616,8 +614,6 @@ bool state_update(ctx_main_t* ctx, const state_event_t* event, u64 now) {
             
         case EVENT_NET_PACKET_RECEIVED:
             handle_packet(ctx, event, now);
-            changed = true;
-            break;
             changed = true;
             break;
             
