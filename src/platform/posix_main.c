@@ -417,53 +417,6 @@ static void handle_io_request(PlatformSocket sock) {
             if (g_ctx.debug_enabled)
               printf("DEBUG: TCP Stream Sent %zu bytes\n", read);
 
-          } else {
-            // ** UDP Fallback Path **
-            const size_t CHUNK_MTU = 1400;
-            size_t offset = 0;
-
-            char ip_str[64];
-            struct in_addr addr;
-            addr.s_addr = g_ctx.io_peer_ip;
-            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-
-            while (offset < read) {
-              size_t chunk_len = read - offset;
-              if (chunk_len > CHUNK_MTU)
-                chunk_len = CHUNK_MTU;
-
-              packet_header_t header = {0};
-              header.magic = MAGIC_TOYS;
-              header.type = PACKET_TYPE_CHUNK_DATA;
-
-              msg_data_t data_msg = {0};
-              data_msg.offset = g_ctx.io_req_offset + offset;
-              data_msg.job_id = 0;
-
-              header.body_length = sizeof(msg_data_t) + chunk_len;
-
-              u8 *ptr = g_ctx.outbox;
-              memcpy(ptr, &header, sizeof(packet_header_t));
-              memcpy(ptr + sizeof(packet_header_t), &data_msg,
-                     sizeof(msg_data_t));
-              memcpy(ptr + sizeof(packet_header_t) + sizeof(msg_data_t),
-                     g_ctx.work_buffer + offset, chunk_len);
-
-              size_t packet_len =
-                  sizeof(packet_header_t) + sizeof(msg_data_t) + chunk_len;
-
-              platform_udp_sendto(sock, g_ctx.outbox, packet_len, ip_str,
-                                  g_ctx.io_peer_port);
-
-              offset += chunk_len;
-
-              // Pacing: Sleep 1ms every 32 packets
-              if ((offset / chunk_len) % 32 == 0) {
-                usleep(1000);
-              }
-            }
-            if (g_ctx.debug_enabled)
-              printf("DEBUG: UDP Burst Sent %zu bytes to %s\n", read, ip_str);
           }
         }
       } else {
