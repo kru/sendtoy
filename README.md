@@ -1,6 +1,6 @@
-# SendToy C
+# Description
 
-A local, peer-to-peer file transfer system optimized for cross-platform compatibility with zero configuration and no internet dependency.
+Send To Y is a local, peer-to-peer file transfer system optimized for cross-platform compatibility with zero configuration and no internet dependency.
 
 ## Features
 

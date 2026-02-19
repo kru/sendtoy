@@ -22,7 +22,7 @@
 
 // --- Platform Interface & Implementation (POSIX) ---
 
-// TigerStyle: Assert macros
+// Assert macros
 #define TIGER_ASSERT(cond)                                                     \
   if (!(cond)) {                                                               \
     fprintf(stderr, "ASSERT FAILED: %s:%d\n", __FILE__, __LINE__);             \
@@ -306,7 +306,7 @@ static ctx_main_t g_ctx;
 // Network Buffers (Statically allocated)
 static u8 g_net_rx_buffer[65536];
 
-// TigerStyle: TCP Stream Reassembly Buffers
+// TCP Stream Reassembly Buffers
 typedef struct {
   u8 buffer[BUFFER_SIZE_LARGE + 131072]; // 4MB + 128KB headroom
   u32 len;
@@ -324,7 +324,7 @@ static void get_downloads_path(char *out_buf, size_t size) {
   }
 }
 
-// TigerStyle: Handle IO Requests from State Machine
+// Handle IO Requests from State Machine
 static void handle_io_request(PlatformSocket sock) {
   if (g_ctx.io_req_type == IO_NONE)
     return;
@@ -660,7 +660,7 @@ int main(int argc, char **argv) {
 
   state_init(&g_ctx);
 
-  // TigerStyle: Init Random Identity (Temporary until Crypto)
+  // Init Random Identity (Temporary until Crypto)
   srand((unsigned int)(time(NULL) ^ getpid()));
   for (int i = 0; i < 32; ++i) {
     g_ctx.my_public_key[i] = (u8)rand();

@@ -794,7 +794,6 @@ int main(void) {
             }
         }
 
-// Handle IO Requests from State Machine
         // 4a. Tick Event
         if (now - last_tick >= 100) {
             state_event_t tick_ev;
@@ -803,7 +802,7 @@ int main(void) {
             handle_io_request(udp_sock); // Handle IO
             last_tick = now;
             
-            // TigerStyle Output: Flush Outbox (Discovery packets)
+            // Output: Flush Outbox (Discovery packets)
             if (g_ctx.outbox_len > 0) {
                  char ip_str[64] = "255.255.255.255";
                  u16 target_port = g_ctx.config_target_port;

@@ -337,7 +337,7 @@ void state_init(ctx_main_t* ctx) {
     }
     
     // Initialize defaults if any (e.g., random keys generation should happen here or be passed in)
-    ctx->debug_enabled = true;
+    ctx->debug_enabled = false;
 }
 
 // Helper to extract filename from path (handles / and \)
